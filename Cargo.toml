@@ -6,6 +6,9 @@ description = "Reads Xbox One / Series controllers (GIP over USB) on macOS, whic
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/patodois/gip-pad"
 readme = "README.md"
+keywords = ["xbox", "gamepad", "controller", "usb", "macos"]
+categories = ["hardware-support", "os::macos-apis", "command-line-utilities"]
+exclude = [".github/"]
 
 [dependencies]
 rusb = { version = "0.9", features = ["vendored"] }
