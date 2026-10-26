@@ -78,9 +78,12 @@ dependencies = [
 
 [[package]]
 name = "gip-pad"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "anyhow",
+ "core-foundation",
+ "core-foundation-sys",
+ "io-kit-sys",
  "nusb",
 ]
 

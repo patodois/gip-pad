@@ -17,7 +17,10 @@ fn bcd(v: u16) -> String {
 /// Prints the USB descriptors, then resets the pad so it announces itself again (GIP 0x02 carries
 /// its firmware and hardware versions) and asks for its metadata (0x04), dumping what comes back.
 fn info() -> Result<()> {
-    let found = find_gip()?;
+    let Detected {
+        found,
+        system_owned,
+    } = find_gip_any()?;
     let device = found.info.open().wait().context("opening the controller")?;
     let desc = device.device_descriptor();
     let s = |i: Option<std::num::NonZeroU8>| {
@@ -77,6 +80,16 @@ fn info() -> Result<()> {
             println!();
         }
     }
+    // A pad that macOS drives cannot be reset or claimed, and needs no help: say so and stop. This is
+    // not a failure, so the exit status is 0.
+    if let Some(owned) = system_owned {
+        println!();
+        println!("{owned}");
+        println!(
+            "Not resetting it or reading its GIP announce and metadata: macOS holds the pad open exclusively."
+        );
+        return Ok(());
+    }
     // A reset makes the pad re-enumerate, which ends this handle; open the new device afterwards
     match device.reset().wait() {
         Ok(()) => {}
@@ -85,7 +98,7 @@ fn info() -> Result<()> {
                 e.kind(),
                 nusb::ErrorKind::NotFound | nusb::ErrorKind::Disconnected
             ) => {}
-        Err(e) => return Err(e).context("resetting the controller"),
+        Err(e) => return Err(found.explain_error(e, "resetting the controller".into())),
     }
     drop(device);
     let mut found_again = None;

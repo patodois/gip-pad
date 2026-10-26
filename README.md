@@ -85,6 +85,41 @@ too. Only PDP pads (vendor 0x0e6f) get the PDP start-up packets.
 The USB layer is the pure-Rust `nusb` crate (IOKit underneath, no C library), so nothing else needs installing. If
 another program holds the pad, opening it may fail; close that program and try again.
 
+## Controllers macOS already supports
+
+`gip-pad` is for wired pads macOS has no driver for. Official Xbox controllers (an Xbox Series pad,
+USB `045e:0b12`, for example) are different: macOS binds its own driver to them and games see them
+through Apple's Game Controller framework, so they need no help from this tool. Such a driver holds
+the pad open exclusively, so `gip-pad` could not claim it anyway.
+
+`gip-pad` detects this by reading the `UsbExclusiveOwner` property that macOS puts on the pad's
+IORegistry entry (it names the driver, such as `XboxUSBDevice`; a user-space program that holds a
+device shows up there as `pid <n>, <name>` instead). A driver named there is a pad macOS drives. What
+happens:
+
+- **Normal mode and `--raw`** skip such pads and keep looking, so a third-party pad plugged in beside an
+  official one is still found. If the only GIP pads present are driven by macOS, `gip-pad` exits with
+  status 1 and says so, for example:
+
+  ```
+  Error: found Microsoft Controller (045e:0b12), but macOS already drives it with its own Xbox controller driver (XboxUSBDevice): games see it through Game Controller, so gip-pad is not needed for it. gip-pad is for wired pads macOS has no driver for.
+  ```
+- **`--info`** still prints the USB descriptors, which macOS lets anyone read, then prints the same
+  explanation instead of resetting the pad and reading its GIP announce and metadata, and exits with
+  status 0. That choice is deliberate: `--info` was asked to describe the pad and did, and nothing is wrong
+  with a pad macOS drives. Normal mode exits with 1 because it could not do what it was asked, to read
+  a pad.
+- **Other failures to open or claim a pad** keep the hint that another program (Chrome, say) may be
+  holding it, but only when the pad has no system driver as its owner. If the owner is a user-space
+  process, its `pid` and name are shown instead. Where macOS reports an exclusive-access error
+  (`0xe00002c5`) and names no owner, the hint stays general because it cannot tell whether a driver or a
+  program holds the pad.
+
+The check only reads the registry. Beyond the descriptor reads of `--info`, no reset, claim or GIP packet is sent to a pad that macOS drives. For library users,
+`find_gip()` skips these pads and returns a `gip_pad::owner::SystemOwned` error (downcast it from the
+`anyhow::Error`) when only such pads are present; `find_gip_any()` also returns them, marked, for
+inspection. On other platforms no owner is ever reported.
+
 ## How it works
 
 The packet layouts follow the Linux [`xpad`](https://github.com/torvalds/linux/blob/master/drivers/input/joystick/xpad.c)

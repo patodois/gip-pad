@@ -11,12 +11,16 @@
 //! - Pad to host: input (0x20) with buttons, triggers and sticks; the guide button (0x07), which asks
 //!   for an acknowledgement when its options carry 0x10.
 
+pub mod owner;
+
 use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
 use nusb::descriptors::TransferType;
 use nusb::transfer::{Buffer, Direction, In, Interrupt, Out};
 use nusb::{DeviceInfo, Endpoint, Interface, MaybeFuture};
+
+use owner::{blocker, Blocker, Owner, SystemOwned};
 
 pub const GIP_CLASS: (u8, u8, u8) = (0xFF, 0x47, 0xD0);
 pub const CMD_ACK: u8 = 0x01;
@@ -358,14 +362,48 @@ fn may_be_unconfigured_pad(listed: &[(u8, u8, u8)], device_class: u8) -> bool {
     listed.is_empty() && matches!(device_class, 0x00 | 0xEF | 0xFF)
 }
 
-/// Finds the first USB interface with the GIP class and interrupt IN and OUT endpoints.
+/// A GIP pad found by [`find_gip_any`], and whether a macOS driver holds it.
+pub struct Detected {
+    pub found: Found,
+    /// Set if a macOS driver already drives this pad: its descriptors can be read, but it cannot be
+    /// reset or claimed, and it needs no help from gip-pad.
+    pub system_owned: Option<SystemOwned>,
+}
+
+fn system_owned(info: &DeviceInfo, driver: String) -> SystemOwned {
+    SystemOwned {
+        vendor: info.vendor_id(),
+        product: info.product_id(),
+        name: owner::display_name(info.manufacturer_string(), info.product_string()),
+        owner: driver,
+    }
+}
+
+/// Finds the first USB interface with the GIP class and interrupt IN and OUT endpoints, skipping
+/// pads that a macOS driver already holds (an official Xbox pad, say): those are used through Game
+/// Controller and cannot be claimed anyway, and a third-party pad plugged in beside one is still
+/// found. If the only GIP pads present are held by the system, the error is a [`SystemOwned`]
+/// (downcast it from the `anyhow::Error` to tell it from the rest).
 ///
 /// macOS lists a device's interfaces only while the device is configured, and nothing configures a
 /// vendor-class pad: after a USB reset (which `--info` does) it stays unconfigured and lists no
 /// interfaces at all. So a device that lists none is opened and its descriptors read instead of
 /// being skipped. A device that is certainly a pad but cannot be opened is an error, not "not found".
 pub fn find_gip() -> Result<Found> {
+    scan(false).map(|d| d.found)
+}
+
+/// Like [`find_gip`], but a pad held by a macOS driver is returned too, with `system_owned` set, if
+/// no other pad is present. For inspecting such a pad: its descriptors are readable.
+pub fn find_gip_any() -> Result<Detected> {
+    scan(true)
+}
+
+fn scan(include_system: bool) -> Result<Detected> {
     let mut unreadable: Vec<String> = Vec::new();
+    // Pads a system driver holds; the first one decides the error if nothing else turns up
+    let mut held: Vec<SystemOwned> = Vec::new();
+    let mut held_found: Option<Detected> = None;
     for info in nusb::list_devices().wait().context("listing USB devices")? {
         let listed: Vec<(u8, u8, u8)> = info
             .interfaces()
@@ -375,9 +413,22 @@ pub fn find_gip() -> Result<Found> {
         if !listed_gip && !may_be_unconfigured_pad(&listed, info.class()) {
             continue;
         }
+        let driver = match owner::exclusive_owner(&info) {
+            Some(Owner::Driver(name)) => Some(name),
+            _ => None,
+        };
+        if let (false, true, Some(name)) = (include_system, listed_gip, &driver) {
+            // Certainly a GIP pad and certainly the system's: leave it alone
+            held.push(system_owned(&info, name.clone()));
+            continue;
+        }
         let device = match info.open().wait() {
             Ok(device) => device,
             Err(e) if listed_gip => {
+                if let Some(name) = driver {
+                    held.push(system_owned(&info, name));
+                    continue;
+                }
                 return Err(e).with_context(|| {
                     format!(
                         "opening the controller {:04x}:{:04x}",
@@ -396,17 +447,37 @@ pub fn find_gip() -> Result<Found> {
             }
         };
         if let Some((config, interface, alt, ep_in, ep_out)) = gip_interface(&device) {
-            return Ok(Found {
-                vendor: info.vendor_id(),
-                product: info.product_id(),
-                config,
-                interface,
-                alt,
-                ep_in,
-                ep_out,
-                info,
-            });
+            let system_owned = driver.map(|name| system_owned(&info, name));
+            let detected = Detected {
+                found: Found {
+                    vendor: info.vendor_id(),
+                    product: info.product_id(),
+                    config,
+                    interface,
+                    alt,
+                    ep_in,
+                    ep_out,
+                    info,
+                },
+                system_owned,
+            };
+            match &detected.system_owned {
+                None => return Ok(detected),
+                Some(owned) => {
+                    held.push(owned.clone());
+                    if include_system && held_found.is_none() {
+                        held_found = Some(detected);
+                    }
+                }
+            }
         }
+    }
+    if let Some(detected) = held_found {
+        return Ok(detected);
+    }
+    // Only the first of several held pads is named
+    if let Some(owned) = held.into_iter().next() {
+        return Err(owned.into());
     }
     if unreadable.is_empty() {
         bail!("no Xbox One / Series controller (GIP over USB) found; is it plugged in by cable?")
@@ -418,28 +489,41 @@ pub fn find_gip() -> Result<Found> {
 }
 
 impl Found {
-    /// Opens the device, selects its configuration and claims the GIP interface.
+    /// Turns a failure to open or claim this pad into the error to report: [`SystemOwned`] if a macOS
+    /// driver holds it, otherwise the error with a hint that fits what is known about the holder.
+    pub fn explain_error(&self, e: nusb::Error, what: String) -> anyhow::Error {
+        let owner = owner::exclusive_owner(&self.info);
+        match blocker(owner.as_ref(), e.kind(), e.os_error()) {
+            Blocker::SystemDriver(name) => system_owned(&self.info, name).into(),
+            other => anyhow::Error::new(e).context(format!("{what}{}", other.hint())),
+        }
+    }
+
+    /// Opens the device, selects its configuration and claims the GIP interface. A pad that a macOS
+    /// driver holds is refused with a [`SystemOwned`] error.
     pub fn open(&self) -> Result<(nusb::Device, Gip)> {
-        let device = self.info.open().wait().context("opening the controller")?;
+        if let Some(Owner::Driver(name)) = owner::exclusive_owner(&self.info) {
+            return Err(system_owned(&self.info, name).into());
+        }
+        let device = self
+            .info
+            .open()
+            .wait()
+            .map_err(|e| self.explain_error(e, "opening the controller".into()))?;
         if device
             .active_configuration()
             .map(|c| c.configuration_value())
             .ok()
             != Some(self.config)
         {
-            device
-                .set_configuration(self.config)
-                .wait()
-                .with_context(|| format!("selecting configuration {}", self.config))?;
+            device.set_configuration(self.config).wait().map_err(|e| {
+                self.explain_error(e, format!("selecting configuration {}", self.config))
+            })?;
         }
-        let interface = device.claim_interface(self.interface).wait().map_err(|e| {
-            let hint = if e.kind() == nusb::ErrorKind::Busy {
-                " (is another program, e.g. Chrome, holding it?)"
-            } else {
-                ""
-            };
-            anyhow::Error::new(e).context(format!("claiming interface {}{hint}", self.interface))
-        })?;
+        let interface = device
+            .claim_interface(self.interface)
+            .wait()
+            .map_err(|e| self.explain_error(e, format!("claiming interface {}", self.interface)))?;
         if self.alt != 0 {
             interface
                 .set_alt_setting(self.alt)

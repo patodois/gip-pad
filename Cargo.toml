@@ -1,6 +1,6 @@
 [package]
 name = "gip-pad"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2021"
 description = "Reads Xbox One / Series controllers (GIP over USB) on macOS, which has no driver for wired third-party pads"
 license = "MIT OR Apache-2.0"
@@ -13,3 +13,10 @@ exclude = [".github/"]
 [dependencies]
 nusb = "0.2.9"
 anyhow = "1"
+
+# Read the IOKit registry (UsbExclusiveOwner) to tell a pad macOS already drives from one it does not.
+# Same crates and versions nusb itself uses on macOS, so nothing new enters the build.
+[target.'cfg(target_os = "macos")'.dependencies]
+io-kit-sys = "0.5.0"
+core-foundation = "0.10.1"
+core-foundation-sys = "0.8.4"
