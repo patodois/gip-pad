@@ -317,62 +317,110 @@ pub struct Found {
     pub ep_out: u8,
 }
 
-/// Finds the first USB interface with the GIP class and interrupt IN and OUT endpoints.
-pub fn find_gip() -> Result<Found> {
-    for info in nusb::list_devices().wait()? {
-        if !info
-            .interfaces()
-            .any(|i| (i.class(), i.subclass(), i.protocol()) == GIP_CLASS)
-        {
-            continue;
-        }
-        let Ok(device) = info.open().wait() else {
-            continue;
-        };
-        for config in device.configurations() {
-            for iface in config.interfaces() {
-                for alt in iface.alt_settings() {
-                    if (alt.class(), alt.subclass(), alt.protocol()) != GIP_CLASS {
-                        continue;
-                    }
-                    let mut ep_in = None;
-                    let mut ep_out = None;
-                    for ep in alt.endpoints() {
-                        if ep.transfer_type() == TransferType::Interrupt {
-                            match ep.direction() {
-                                Direction::In => ep_in = ep_in.or(Some(ep.address())),
-                                Direction::Out => ep_out = ep_out.or(Some(ep.address())),
-                            }
+/// The GIP interface of an opened device: configuration, interface, alternate setting and the
+/// interrupt endpoints, or `None` if the device has none.
+fn gip_interface(device: &nusb::Device) -> Option<(u8, u8, u8, u8, u8)> {
+    for config in device.configurations() {
+        for iface in config.interfaces() {
+            for alt in iface.alt_settings() {
+                if (alt.class(), alt.subclass(), alt.protocol()) != GIP_CLASS {
+                    continue;
+                }
+                let mut ep_in = None;
+                let mut ep_out = None;
+                for ep in alt.endpoints() {
+                    if ep.transfer_type() == TransferType::Interrupt {
+                        match ep.direction() {
+                            Direction::In => ep_in = ep_in.or(Some(ep.address())),
+                            Direction::Out => ep_out = ep_out.or(Some(ep.address())),
                         }
                     }
-                    if let (Some(i), Some(o)) = (ep_in, ep_out) {
-                        return Ok(Found {
-                            vendor: info.vendor_id(),
-                            product: info.product_id(),
-                            config: config.configuration_value(),
-                            interface: alt.interface_number(),
-                            alt: alt.alternate_setting(),
-                            ep_in: i,
-                            ep_out: o,
-                            info,
-                        });
-                    }
+                }
+                if let (Some(i), Some(o)) = (ep_in, ep_out) {
+                    return Some((
+                        config.configuration_value(),
+                        alt.interface_number(),
+                        alt.alternate_setting(),
+                        i,
+                        o,
+                    ));
                 }
             }
         }
     }
-    bail!("no Xbox One / Series controller (GIP over USB) found; is it plugged in by cable?")
+    None
+}
+
+/// Whether a device that lists these interfaces might be a pad that macOS has not configured: it
+/// lists none, and its class leaves the real class to the interfaces (0x00, 0xEF) or is vendor
+/// specific (0xFF).
+fn may_be_unconfigured_pad(listed: &[(u8, u8, u8)], device_class: u8) -> bool {
+    listed.is_empty() && matches!(device_class, 0x00 | 0xEF | 0xFF)
+}
+
+/// Finds the first USB interface with the GIP class and interrupt IN and OUT endpoints.
+///
+/// macOS lists a device's interfaces only while the device is configured, and nothing configures a
+/// vendor-class pad: after a USB reset (which `--info` does) it stays unconfigured and lists no
+/// interfaces at all. So a device that lists none is opened and its descriptors read instead of
+/// being skipped. A device that is certainly a pad but cannot be opened is an error, not "not found".
+pub fn find_gip() -> Result<Found> {
+    let mut unreadable: Vec<String> = Vec::new();
+    for info in nusb::list_devices().wait().context("listing USB devices")? {
+        let listed: Vec<(u8, u8, u8)> = info
+            .interfaces()
+            .map(|i| (i.class(), i.subclass(), i.protocol()))
+            .collect();
+        let listed_gip = listed.contains(&GIP_CLASS);
+        if !listed_gip && !may_be_unconfigured_pad(&listed, info.class()) {
+            continue;
+        }
+        let device = match info.open().wait() {
+            Ok(device) => device,
+            Err(e) if listed_gip => {
+                return Err(e).with_context(|| {
+                    format!(
+                        "opening the controller {:04x}:{:04x}",
+                        info.vendor_id(),
+                        info.product_id()
+                    )
+                });
+            }
+            Err(e) => {
+                unreadable.push(format!(
+                    "{:04x}:{:04x} ({e})",
+                    info.vendor_id(),
+                    info.product_id()
+                ));
+                continue;
+            }
+        };
+        if let Some((config, interface, alt, ep_in, ep_out)) = gip_interface(&device) {
+            return Ok(Found {
+                vendor: info.vendor_id(),
+                product: info.product_id(),
+                config,
+                interface,
+                alt,
+                ep_in,
+                ep_out,
+                info,
+            });
+        }
+    }
+    if unreadable.is_empty() {
+        bail!("no Xbox One / Series controller (GIP over USB) found; is it plugged in by cable?")
+    }
+    bail!(
+        "no Xbox One / Series controller (GIP over USB) found; could not read these devices: {}",
+        unreadable.join(", ")
+    )
 }
 
 impl Found {
     /// Opens the device, selects its configuration and claims the GIP interface.
     pub fn open(&self) -> Result<(nusb::Device, Gip)> {
-        const HELD: &str = "is another program, e.g. Chrome, holding it?";
-        let device = self
-            .info
-            .open()
-            .wait()
-            .with_context(|| format!("opening the controller ({HELD})"))?;
+        let device = self.info.open().wait().context("opening the controller")?;
         if device
             .active_configuration()
             .map(|c| c.configuration_value())
@@ -382,17 +430,28 @@ impl Found {
             device
                 .set_configuration(self.config)
                 .wait()
-                .context("configuring the controller")?;
+                .with_context(|| format!("selecting configuration {}", self.config))?;
         }
-        let interface = device
-            .claim_interface(self.interface)
-            .wait()
-            .with_context(|| format!("claiming the controller ({HELD})"))?;
+        let interface = device.claim_interface(self.interface).wait().map_err(|e| {
+            let hint = if e.kind() == nusb::ErrorKind::Busy {
+                " (is another program, e.g. Chrome, holding it?)"
+            } else {
+                ""
+            };
+            anyhow::Error::new(e).context(format!("claiming interface {}{hint}", self.interface))
+        })?;
         if self.alt != 0 {
-            interface.set_alt_setting(self.alt).wait()?;
+            interface
+                .set_alt_setting(self.alt)
+                .wait()
+                .with_context(|| format!("selecting alternate setting {}", self.alt))?;
         }
-        let reader = interface.endpoint::<Interrupt, In>(self.ep_in)?;
-        let writer = interface.endpoint::<Interrupt, Out>(self.ep_out)?;
+        let reader = interface
+            .endpoint::<Interrupt, In>(self.ep_in)
+            .with_context(|| format!("opening endpoint {:#04x}", self.ep_in))?;
+        let writer = interface
+            .endpoint::<Interrupt, Out>(self.ep_out)
+            .with_context(|| format!("opening endpoint {:#04x}", self.ep_out))?;
         let gip = Gip {
             _interface: interface,
             reader,
@@ -488,9 +547,11 @@ pub fn trigger(v: u16) -> f32 {
 }
 
 /// Reads a controller on its own thread, so a game loop can take the latest state without
-/// blocking. If no pad is found or it is unplugged, it keeps retrying every second.
+/// blocking. If no pad is found or it is unplugged, it keeps retrying every second and keeps the
+/// reason in [`PadReader::last_error`].
 pub struct PadReader {
     latest: std::sync::Arc<std::sync::Mutex<Option<Pad>>>,
+    error: std::sync::Arc<std::sync::Mutex<Option<String>>>,
     stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
     thread: Option<std::thread::JoinHandle<()>>,
 }
@@ -500,19 +561,28 @@ impl PadReader {
         use std::sync::atomic::Ordering;
         let latest = std::sync::Arc::new(std::sync::Mutex::new(None));
         let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let (l, s) = (latest.clone(), stop.clone());
+        let error = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let (l, s, er) = (latest.clone(), stop.clone(), error.clone());
         let thread = std::thread::spawn(move || {
             while !s.load(Ordering::Relaxed) {
-                let Ok(mut c) = Controller::open() else {
-                    std::thread::sleep(Duration::from_secs(1));
-                    continue;
+                let mut c = match Controller::open() {
+                    Ok(c) => c,
+                    Err(e) => {
+                        *er.lock().unwrap() = Some(format!("{e:#}"));
+                        std::thread::sleep(Duration::from_secs(1));
+                        continue;
+                    }
                 };
+                *er.lock().unwrap() = None;
                 *l.lock().unwrap() = Some(c.state());
                 while !s.load(Ordering::Relaxed) {
                     match c.poll(Duration::from_millis(100)) {
                         Ok(Some(_)) => *l.lock().unwrap() = Some(c.state()),
                         Ok(None) => {}
-                        Err(_) => break,
+                        Err(e) => {
+                            *er.lock().unwrap() = Some(format!("{e:#}"));
+                            break;
+                        }
                     }
                 }
                 *l.lock().unwrap() = None;
@@ -520,6 +590,7 @@ impl PadReader {
         });
         Self {
             latest,
+            error,
             stop,
             thread: Some(thread),
         }
@@ -528,6 +599,12 @@ impl PadReader {
     /// The latest state, or `None` while no pad is connected.
     pub fn latest(&self) -> Option<Pad> {
         *self.latest.lock().unwrap()
+    }
+
+    /// Why there is no pad right now (not found, held by another program, unplugged), or `None`
+    /// while one is being read.
+    pub fn last_error(&self) -> Option<String> {
+        self.error.lock().unwrap().clone()
     }
 }
 
@@ -594,6 +671,16 @@ mod tests {
             strings(b"\x1a\x00Windows.Xbox.Input.Gamepad\x1b\x00ab", 6),
             ["Windows.Xbox.Input.Gamepad"]
         );
+    }
+
+    #[test]
+    fn unconfigured_vendor_devices_are_inspected() {
+        // The pad after a USB reset: no interfaces listed, vendor-specific device class
+        assert!(may_be_unconfigured_pad(&[], 0xFF));
+        assert!(may_be_unconfigured_pad(&[], 0x00));
+        // A hub, or a device whose interfaces are listed and are not GIP, is not worth opening
+        assert!(!may_be_unconfigured_pad(&[], 0x09));
+        assert!(!may_be_unconfigured_pad(&[(0x03, 0, 0)], 0x00));
     }
 
     #[test]

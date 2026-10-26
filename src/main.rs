@@ -89,17 +89,24 @@ fn info() -> Result<()> {
     }
     drop(device);
     let mut found_again = None;
+    let mut last_error = None;
     for _ in 0..30 {
         std::thread::sleep(Duration::from_millis(100));
-        if let Ok(f) = find_gip() {
-            if let Ok(opened) = f.open() {
+        match find_gip().and_then(|f| f.open()) {
+            Ok(opened) => {
                 found_again = Some(opened);
                 break;
             }
+            Err(e) => last_error = Some(e),
         }
     }
-    let (_device, mut gip) =
-        found_again.context("the controller did not come back after the reset")?;
+    let (_device, mut gip) = match (found_again, last_error) {
+        (Some(opened), _) => opened,
+        (None, Some(e)) => {
+            return Err(e).context("the controller did not come back after the reset")
+        }
+        (None, None) => anyhow::bail!("the controller did not come back after the reset"),
+    };
     let raw = std::env::args().any(|a| a == "--raw");
     let mut metadata: Vec<u8> = Vec::new();
     let mut received = 0usize;
@@ -145,11 +152,11 @@ fn info() -> Result<()> {
                 metadata[..body.len().min(total)].copy_from_slice(&body[..body.len().min(total)]);
                 received = body.len();
             }
-            (0x04, Some(offset)) if !metadata.is_empty() => {
-                if offset + body.len() <= metadata.len() {
-                    metadata[offset..offset + body.len()].copy_from_slice(body);
-                    received = received.max(offset + body.len());
-                }
+            (0x04, Some(offset))
+                if !metadata.is_empty() && offset + body.len() <= metadata.len() =>
+            {
+                metadata[offset..offset + body.len()].copy_from_slice(body);
+                received = received.max(offset + body.len());
             }
             _ => {}
         }
