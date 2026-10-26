@@ -8,7 +8,7 @@ so games and the Game Controller framework never see them. This repository has t
 
 1. **SDL3 with libusb:** SDL3 3.4.12 and later drive GIP pads directly over USB, so any game or app
    built on SDL3 can use the pad. SDL just has to be built with libusb.
-2. **`gip-pad`:** a small Rust reader that talks to the pad through libusb. It prints buttons, triggers
+2. **`gip-pad`:** a small Rust reader that talks to the pad directly over USB (pure Rust, through the `nusb` crate). It prints buttons, triggers
    and sticks, and `--info` shows what the pad reports about itself.
 
 Neither makes the pad visible to every app on the Mac. That needs a DriverKit driver, which Apple
@@ -82,7 +82,7 @@ cargo build --release
 the first interface with the GIP class and its interrupt endpoints, so other GIP pads should work
 too. Only PDP pads (vendor 0x0e6f) get the PDP start-up packets.
 
-libusb is built in (the `rusb` crate's `vendored` feature), so nothing else needs installing. If
+The USB layer is the pure-Rust `nusb` crate (IOKit underneath, no C library), so nothing else needs installing. If
 another program holds the pad, opening it may fail; close that program and try again.
 
 ## How it works

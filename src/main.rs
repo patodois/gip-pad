@@ -5,15 +5,29 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use gip_pad::*;
+use nusb::descriptors::language_id::US_ENGLISH;
+use nusb::MaybeFuture;
+
+/// A BCD-coded USB version such as 0x0200 as "2.0.0", like libusb prints it.
+fn bcd(v: u16) -> String {
+    let d = |n: u16| (n >> 4 & 0xF) * 10 + (n & 0xF);
+    format!("{}.{}.{}", d(v >> 8), v >> 4 & 0xF, v & 0xF)
+}
 
 /// Prints the USB descriptors, then resets the pad so it announces itself again (GIP 0x02 carries
 /// its firmware and hardware versions) and asks for its metadata (0x04), dumping what comes back.
-fn info(ctx: &rusb::Context) -> Result<()> {
-    let (dev, desc, config, iface, ep_in, ep_out) = find_gip(ctx)?;
-    let handle = dev.open().context("opening the controller")?;
-    let s = |i: Option<u8>| {
-        i.and_then(|i| handle.read_string_descriptor_ascii(i).ok())
-            .unwrap_or_default()
+fn info() -> Result<()> {
+    let found = find_gip()?;
+    let device = found.info.open().wait().context("opening the controller")?;
+    let desc = device.device_descriptor();
+    let s = |i: Option<std::num::NonZeroU8>| {
+        i.and_then(|i| {
+            device
+                .get_string_descriptor(i, US_ENGLISH, Duration::from_millis(500))
+                .wait()
+                .ok()
+        })
+        .unwrap_or_default()
     };
     println!(
         "vendor {:04x} product {:04x}",
@@ -28,94 +42,81 @@ fn info(ctx: &rusb::Context) -> Result<()> {
     );
     println!(
         "usb {} device version {} class {:02x}/{:02x}/{:02x} max packet {} configurations {}",
-        desc.usb_version(),
-        desc.device_version(),
-        desc.class_code(),
-        desc.sub_class_code(),
-        desc.protocol_code(),
-        desc.max_packet_size(),
+        bcd(desc.usb_version()),
+        bcd(desc.device_version()),
+        desc.class(),
+        desc.subclass(),
+        desc.protocol(),
+        desc.max_packet_size_0(),
         desc.num_configurations()
     );
-    for c in 0..desc.num_configurations() {
-        let cfg = dev.config_descriptor(c)?;
+    for cfg in device.configurations() {
         println!(
             "configuration {} max power {} mA",
-            cfg.number(),
-            cfg.max_power()
+            cfg.configuration_value(),
+            u16::from(cfg.max_power()) * 2
         );
-        for i in cfg.interfaces() {
-            for alt in i.descriptors() {
+        for alt in cfg.interface_alt_settings() {
+            print!(
+                "  interface {} alt {} class {:02x}/{:02x}/{:02x}:",
+                alt.interface_number(),
+                alt.alternate_setting(),
+                alt.class(),
+                alt.subclass(),
+                alt.protocol()
+            );
+            for ep in alt.endpoints() {
                 print!(
-                    "  interface {} alt {} class {:02x}/{:02x}/{:02x}:",
-                    alt.interface_number(),
-                    alt.setting_number(),
-                    alt.class_code(),
-                    alt.sub_class_code(),
-                    alt.protocol_code()
+                    " {:#04x} {:?} {}B/{}ms",
+                    ep.address(),
+                    ep.transfer_type(),
+                    ep.max_packet_size(),
+                    ep.interval()
                 );
-                for ep in alt.endpoint_descriptors() {
-                    print!(
-                        " {:#04x} {:?} {}B/{}ms",
-                        ep.address(),
-                        ep.transfer_type(),
-                        ep.max_packet_size(),
-                        ep.interval()
-                    );
-                }
-                println!();
             }
+            println!();
         }
     }
     // A reset makes the pad re-enumerate, which ends this handle; open the new device afterwards
-    match handle.reset() {
-        Ok(()) | Err(rusb::Error::NotFound) | Err(rusb::Error::NoDevice) => {}
+    match device.reset().wait() {
+        Ok(()) => {}
+        Err(e)
+            if matches!(
+                e.kind(),
+                nusb::ErrorKind::NotFound | nusb::ErrorKind::Disconnected
+            ) => {}
         Err(e) => return Err(e).context("resetting the controller"),
     }
-    drop(handle);
-    let mut found = None;
+    drop(device);
+    let mut found_again = None;
     for _ in 0..30 {
         std::thread::sleep(Duration::from_millis(100));
-        if let Ok(f) = find_gip(ctx) {
-            if let Ok(h) = f.0.open() {
-                found = Some(h);
+        if let Ok(f) = find_gip() {
+            if let Ok(opened) = f.open() {
+                found_again = Some(opened);
                 break;
             }
         }
     }
-    let handle = found.context("the controller did not come back after the reset")?;
-    if handle.active_configuration().ok() != Some(config) {
-        handle.set_active_configuration(config)?;
-    }
-    handle.claim_interface(iface)?;
-    let mut gip = Gip {
-        handle,
-        ep_in,
-        ep_out,
-        seq: 0,
-    };
+    let (_device, mut gip) =
+        found_again.context("the controller did not come back after the reset")?;
     let raw = std::env::args().any(|a| a == "--raw");
-    let mut buf = [0u8; 64];
     let mut metadata: Vec<u8> = Vec::new();
     let mut received = 0usize;
     let mut announced = false;
     // After a reset the pad announces itself until the host answers; wait for that first
     let until = std::time::Instant::now() + Duration::from_millis(1500);
     while !announced && std::time::Instant::now() < until {
-        let n = match gip
-            .handle
-            .read_interrupt(gip.ep_in, &mut buf, Duration::from_millis(100))
-        {
-            Ok(n) => n,
-            Err(rusb::Error::Timeout) => continue,
-            Err(e) => return Err(e.into()),
+        let Some(p) = gip.read(Duration::from_millis(100))? else {
+            continue;
         };
         if raw {
-            println!("{:02x?}", &buf[..n]);
+            println!("{:02x?}", p);
         }
-        if let Some(h) = Header::parse(&buf[..n]) {
+        if let Some(h) = Header::parse(&p) {
             if h.command == 0x02 {
                 announced = true;
-                if let Some(d) = describe_announce(h.body(&buf[..n])) {
+                if let Some(d) = describe_announce(h.body(&p)) {
                     println!("announce: {d}");
                 }
             }
@@ -124,15 +125,9 @@ fn info(ctx: &rusb::Context) -> Result<()> {
     gip.send(0x04, OPT_INTERNAL, &[])?;
     let until = std::time::Instant::now() + Duration::from_millis(2500);
     while std::time::Instant::now() < until {
-        let n = match gip
-            .handle
-            .read_interrupt(gip.ep_in, &mut buf, Duration::from_millis(100))
-        {
-            Ok(n) => n,
-            Err(rusb::Error::Timeout) => continue,
-            Err(e) => return Err(e.into()),
+        let Some(p) = gip.read(Duration::from_millis(100))? else {
+            continue;
         };
-        let p = buf[..n].to_vec();
         if raw {
             println!("{:02x?}", p);
         }
@@ -188,7 +183,7 @@ fn info(ctx: &rusb::Context) -> Result<()> {
 fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.iter().any(|a| a == "--info") {
-        return info(&rusb::Context::new()?);
+        return info();
     }
     let raw = args.iter().any(|a| a == "--raw");
     let seconds: Option<u64> = args
@@ -227,5 +222,18 @@ fn main() -> Result<()> {
             out.flush()?;
             last = line;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::bcd;
+
+    #[test]
+    fn usb_versions_print_like_libusb() {
+        assert_eq!(bcd(0x0200), "2.0.0");
+        assert_eq!(bcd(0x0110), "1.1.0");
+        assert_eq!(bcd(0x0321), "3.2.1");
+        assert_eq!(bcd(0x1234), "12.3.4");
     }
 }

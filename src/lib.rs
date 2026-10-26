@@ -3,7 +3,7 @@
 //! macOS has no driver for wired third-party Xbox pads such as the PDP Afterglow Wave: they show up as
 //! a vendor-class USB device (class 0xFF, interface subclass 0x47, protocol 0xD0) and no HID device is
 //! created, so games and the Game Controller framework never see them. This talks to the pad directly
-//! through libusb. The packet layouts follow the Linux `xpad` driver.
+//! through the pure-Rust `nusb` crate (IOKit underneath). The packet layouts follow the Linux `xpad` driver.
 //!
 //! GIP packets start with a 4-byte header: command, options, sequence number, payload length.
 //! - Host to pad, to start input: power on (0x05), and for PDP pads also LED on (0x0A) and the
@@ -14,7 +14,9 @@
 use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
-use rusb::{Direction, TransferType, UsbContext};
+use nusb::descriptors::TransferType;
+use nusb::transfer::{Buffer, Direction, In, Interrupt, Out};
+use nusb::{DeviceInfo, Endpoint, Interface, MaybeFuture};
 
 pub const GIP_CLASS: (u8, u8, u8) = (0xFF, 0x47, 0xD0);
 pub const CMD_ACK: u8 = 0x01;
@@ -212,7 +214,11 @@ pub fn strings(data: &[u8], min: usize) -> Vec<String> {
 }
 
 pub struct Gip {
-    pub handle: rusb::DeviceHandle<rusb::Context>,
+    // Held so the claimed interface outlives the endpoints
+    _interface: Interface,
+    reader: Endpoint<Interrupt, In>,
+    writer: Endpoint<Interrupt, Out>,
+    /// Endpoint addresses
     pub ep_in: u8,
     pub ep_out: u8,
     pub seq: u8,
@@ -223,10 +229,35 @@ impl Gip {
         self.seq = self.seq.wrapping_add(1).max(1);
         let mut packet = vec![cmd, options, self.seq, payload.len() as u8];
         packet.extend_from_slice(payload);
-        self.handle
-            .write_interrupt(self.ep_out, &packet, Duration::from_millis(500))
-            .with_context(|| format!("sending command {cmd:#04x}"))?;
+        self.write(&packet)
+            .with_context(|| format!("sending command {cmd:#04x}"))
+    }
+
+    /// Writes one raw packet to the interrupt OUT endpoint, waiting up to 500 ms.
+    pub fn write(&mut self, packet: &[u8]) -> Result<()> {
+        let mut buf = Buffer::new(packet.len());
+        buf.extend_from_slice(packet);
+        let done = self
+            .writer
+            .transfer_blocking(buf, Duration::from_millis(500));
+        done.status?;
         Ok(())
+    }
+
+    /// Waits up to `timeout` for one packet from the interrupt IN endpoint; `None` on a timeout.
+    /// The next read is queued as soon as one arrives, so no report is missed between calls.
+    pub fn read(&mut self, timeout: Duration) -> Result<Option<Vec<u8>>> {
+        if self.reader.pending() == 0 {
+            let size = self.reader.max_packet_size().max(1);
+            self.reader.submit(Buffer::new(size));
+        }
+        let Some(done) = self.reader.wait_next_complete(timeout) else {
+            return Ok(None);
+        };
+        let size = self.reader.max_packet_size().max(1);
+        self.reader.submit(Buffer::new(size));
+        done.status?;
+        Ok(Some(done.buffer[..done.actual_len].to_vec()))
     }
 
     /// Acknowledges a packet whose options ask for it. The ack carries the acknowledged packet's
@@ -250,10 +281,7 @@ impl Gip {
             m0,
             m1,
         ];
-        self.handle
-            .write_interrupt(self.ep_out, &packet, Duration::from_millis(500))
-            .context("sending an acknowledgement")?;
-        Ok(())
+        self.write(&packet).context("sending an acknowledgement")
     }
 
     /// Rumble for a moment, so the pad shows it is listening. Strength 0..=100 per motor.
@@ -277,30 +305,39 @@ impl Gip {
     }
 }
 
-pub fn find_gip(
-    ctx: &rusb::Context,
-) -> Result<(
-    rusb::Device<rusb::Context>,
-    rusb::DeviceDescriptor,
-    u8,
-    u8,
-    u8,
-    u8,
-)> {
-    for dev in ctx.devices()?.iter() {
-        let desc = dev.device_descriptor()?;
-        for c in 0..desc.num_configurations() {
-            let Ok(config) = dev.config_descriptor(c) else {
-                continue;
-            };
+/// A GIP interface found on a USB device, not yet opened.
+pub struct Found {
+    pub info: DeviceInfo,
+    pub vendor: u16,
+    pub product: u16,
+    pub config: u8,
+    pub interface: u8,
+    pub alt: u8,
+    pub ep_in: u8,
+    pub ep_out: u8,
+}
+
+/// Finds the first USB interface with the GIP class and interrupt IN and OUT endpoints.
+pub fn find_gip() -> Result<Found> {
+    for info in nusb::list_devices().wait()? {
+        if !info
+            .interfaces()
+            .any(|i| (i.class(), i.subclass(), i.protocol()) == GIP_CLASS)
+        {
+            continue;
+        }
+        let Ok(device) = info.open().wait() else {
+            continue;
+        };
+        for config in device.configurations() {
             for iface in config.interfaces() {
-                for alt in iface.descriptors() {
-                    if (alt.class_code(), alt.sub_class_code(), alt.protocol_code()) != GIP_CLASS {
+                for alt in iface.alt_settings() {
+                    if (alt.class(), alt.subclass(), alt.protocol()) != GIP_CLASS {
                         continue;
                     }
                     let mut ep_in = None;
                     let mut ep_out = None;
-                    for ep in alt.endpoint_descriptors() {
+                    for ep in alt.endpoints() {
                         if ep.transfer_type() == TransferType::Interrupt {
                             match ep.direction() {
                                 Direction::In => ep_in = ep_in.or(Some(ep.address())),
@@ -309,13 +346,63 @@ pub fn find_gip(
                         }
                     }
                     if let (Some(i), Some(o)) = (ep_in, ep_out) {
-                        return Ok((dev, desc, config.number(), alt.interface_number(), i, o));
+                        return Ok(Found {
+                            vendor: info.vendor_id(),
+                            product: info.product_id(),
+                            config: config.configuration_value(),
+                            interface: alt.interface_number(),
+                            alt: alt.alternate_setting(),
+                            ep_in: i,
+                            ep_out: o,
+                            info,
+                        });
                     }
                 }
             }
         }
     }
     bail!("no Xbox One / Series controller (GIP over USB) found; is it plugged in by cable?")
+}
+
+impl Found {
+    /// Opens the device, selects its configuration and claims the GIP interface.
+    pub fn open(&self) -> Result<(nusb::Device, Gip)> {
+        const HELD: &str = "is another program, e.g. Chrome, holding it?";
+        let device = self
+            .info
+            .open()
+            .wait()
+            .with_context(|| format!("opening the controller ({HELD})"))?;
+        if device
+            .active_configuration()
+            .map(|c| c.configuration_value())
+            .ok()
+            != Some(self.config)
+        {
+            device
+                .set_configuration(self.config)
+                .wait()
+                .context("configuring the controller")?;
+        }
+        let interface = device
+            .claim_interface(self.interface)
+            .wait()
+            .with_context(|| format!("claiming the controller ({HELD})"))?;
+        if self.alt != 0 {
+            interface.set_alt_setting(self.alt).wait()?;
+        }
+        let reader = interface.endpoint::<Interrupt, In>(self.ep_in)?;
+        let writer = interface.endpoint::<Interrupt, Out>(self.ep_out)?;
+        let gip = Gip {
+            _interface: interface,
+            reader,
+            writer,
+            ep_in: self.ep_in,
+            ep_out: self.ep_out,
+            seq: 0,
+        };
+        Ok((device, gip))
+    }
 }
 
 /// An opened and started controller.
@@ -331,30 +418,14 @@ impl Controller {
     /// Finds the first GIP pad, claims it and sends the start packets (and the PDP ones for PDP
     /// pads), so it begins sending input.
     pub fn open() -> Result<Self> {
-        let ctx = rusb::Context::new()?;
-        let (dev, desc, config, iface, ep_in, ep_out) = find_gip(&ctx)?;
-        let handle = dev
-            .open()
-            .context("opening the controller (is another program, e.g. Chrome, holding it?)")?;
-        let name = handle
-            .read_product_string_ascii(&desc)
-            .unwrap_or_else(|_| "?".into());
-        if handle.active_configuration().ok() != Some(config) {
-            handle
-                .set_active_configuration(config)
-                .context("configuring the controller")?;
-        }
-        handle
-            .claim_interface(iface)
-            .context("claiming the controller (is another program, e.g. Chrome, holding it?)")?;
-        let mut gip = Gip {
-            handle,
-            ep_in,
-            ep_out,
-            seq: 0,
-        };
+        let found = find_gip()?;
+        let (_device, mut gip) = found.open()?;
+        let name = found
+            .info
+            .product_string()
+            .map_or_else(|| "?".into(), str::to_string);
         gip.send(CMD_POWER, OPT_INTERNAL, &[0x00])?;
-        if desc.vendor_id() == PDP_VENDOR {
+        if found.vendor == PDP_VENDOR {
             // PDP pads stay silent until they get these (xpad: xboxone_pdp_led_on, xboxone_pdp_auth)
             gip.send(CMD_LED, OPT_INTERNAL, &[0x00, 0x01, 0x14])?;
             gip.send(CMD_AUTHENTICATE, OPT_INTERNAL, &[0x01, 0x00])?;
@@ -362,8 +433,8 @@ impl Controller {
         Ok(Self {
             gip,
             name,
-            vendor: desc.vendor_id(),
-            product: desc.product_id(),
+            vendor: found.vendor,
+            product: found.product,
             pad: Pad::default(),
         })
     }
@@ -371,17 +442,13 @@ impl Controller {
     /// Waits up to `timeout` for one packet, acknowledges it if asked, and updates the state.
     /// Returns the raw packet, or `None` on a timeout.
     pub fn poll(&mut self, timeout: Duration) -> Result<Option<Vec<u8>>> {
-        let mut buf = [0u8; 64];
-        let n = match self
+        let Some(p) = self
             .gip
-            .handle
-            .read_interrupt(self.gip.ep_in, &mut buf, timeout)
-        {
-            Ok(n) => n,
-            Err(rusb::Error::Timeout) => return Ok(None),
-            Err(e) => return Err(e).context("reading from the controller"),
+            .read(timeout)
+            .context("reading from the controller")?
+        else {
+            return Ok(None);
         };
-        let p = buf[..n].to_vec();
         if p.len() >= 4 {
             if p[1] & OPT_ACK_WANTED != 0 {
                 if let Some(h) = Header::parse(&p) {
