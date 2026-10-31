@@ -17,3 +17,25 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - run: cargo build --release
       - run: cargo test
+
+  # Game files, decompiled or third-party code and secrets must never reach this public repository: this runs
+  # tools/check_public_tree.py on the commits of the push or pull request (a new branch: all of its history).
+  public-tree:
+    name: Public tree (no game files, decompiled code or secrets)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Check the commits of this push or pull request
+        env:
+          BASE: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.event.before }}
+          HEAD: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          if [ -n "$BASE" ] && [ "$BASE" != 0000000000000000000000000000000000000000 ] && git cat-file -e "$BASE^{commit}" 2>/dev/null; then
+            python3 tools/check_public_tree.py --range "$BASE..$HEAD"
+          else
+            python3 tools/check_public_tree.py --range "$HEAD"
+          fi
