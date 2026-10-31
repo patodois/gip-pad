@@ -35,10 +35,10 @@ This is the pad the code was written and tested with:
 | USB | 2.0, device class `ff`, device version 3.00 |
 | Interface 0 | GIP (`ff/47/d0`), interrupt IN `0x81`, OUT `0x01`, 64 bytes, 4 ms |
 | Interface 1 | headset audio (isochronous), not used here |
-| Firmware / hardware (from the GIP announce packet) | 2.0.3.0 / 2.1.1.1 |
+| Versions (from the GIP announce packet) | firmware 2.0.3.0; hardware 2.0; RF, security and GIP protocol 1.0 each |
 | Preferred types (from the GIP metadata) | `Windows.Xbox.Input.Gamepad`, `Victrix.Xbox.Gamepad.Gambit` |
 | Input report | `0x20`, 50 bytes (payload `0x2e`); Share is bit 0 of byte 32 |
-| Start-up | power on, then PDP's LED-on and authentication-done packets |
+| Start-up | power on, then the LED-on and `0x06` security packets this pad waits for |
 | Rear buttons | mirrored by the pad itself to D-pad Up and B; they send no bits of their own |
 
 The metadata suggests the Afterglow Wave runs the same firmware platform as PDP's Victrix Gambit, so
@@ -75,7 +75,7 @@ Share (`misc1`) and Guide.
 cargo build --release
 ./target/release/gip-pad            # live line: sticks, triggers, pressed buttons
 ./target/release/gip-pad --raw      # every packet in hex
-./target/release/gip-pad --info     # USB descriptors, firmware/hardware versions, metadata
+./target/release/gip-pad --info     # USB descriptors, firmware, hardware and protocol versions, metadata
 ```
 
 `--info` resets the pad so it announces itself again, then reads its metadata. The reader finds
@@ -122,10 +122,41 @@ inspection. On other platforms no owner is ever reported.
 
 ## How it works
 
-The packet layouts follow the Linux [`xpad`](https://github.com/torvalds/linux/blob/master/drivers/input/joystick/xpad.c)
-and [`xone`](https://github.com/dlundqvist/xone) drivers and Microsoft's published
+`src/main.rs` documents what is sent and received.
+
+### Provenance
+
+The protocol code was written by an AI (Claude) from its general knowledge of GIP and of the Linux
+[`xpad`](https://github.com/torvalds/linux/blob/master/drivers/input/joystick/xpad.c) and
+[`xone`](https://github.com/dlundqvist/xone) drivers, without reading their source at the time. It was
+then checked against a real PDP pad and afterwards against Microsoft's published
 [MS-GIPUSB](https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-gipusb/e7c90904-5e21-426e-b9ad-d82adeee0dbc)
-specification. No code was copied. `src/main.rs` documents what is sent and received.
+specification. No source text from xpad, xone or the specification was copied.
+
+What MS-GIPUSB states, and the code matches:
+
+- Start: Set Device State, command `0x05`, flags `0x20`, state `0x00` (Tables 39 and 40, section 3.1.5.5.5).
+- The LED command `0x0A` layout: command, pattern, intensity (Tables 41 and 42, section 3.1.5.5.7).
+- Header: 4 bytes, with bit 7 of the length extending it into a varint; the flag bits for fragment,
+  first fragment, system message and acknowledge request (Tables 12 and 14, section 2.2.10).
+- Input report `0x20`: buttons in bytes 4 and 5, triggers 6 to 9 (0 to 1023), sticks 10 to 17
+  (Table 57, section 3.1.5.6.1.1).
+- Rumble: the Direct Motor command `0x09` (Table 56, section 3.1.5.6.1).
+- Announce `0x02` ("Hello Device"): device ID, vendor, product, firmware major, minor, build and
+  revision as 16-bit fields, then hardware, RF, security and GIP versions as one-byte major.minor pairs
+  (Table 27, section 3.1.5.5.1).
+- A packet with the acknowledge flag must be acknowledged with a type `0x01` packet of length 9
+  (Table 26, section 3.1.5.1).
+
+What the specification text does not state, and was confirmed only on the PDP pad:
+
+- The payload layout of the acknowledgement.
+- The `01 00` payload of the `0x06` security packet, and that this pad sends no input until it gets it
+  and the LED packet.
+- The Guide button byte: the `0x07` packet is listed with a 2-byte payload, and section 3.1.5.5.6
+  describes only behaviour. Bit 0 of the first payload byte is what the pad sends.
+- The position of the Share button. Table 62 puts the Console Function Map at byte 18 of a 32-byte
+  payload; this pad sends a 46-byte payload (`0x2e`) with Share at bit 0 of byte 32.
 
 ## Disclaimer
 

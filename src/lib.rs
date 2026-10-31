@@ -3,11 +3,16 @@
 //! macOS has no driver for wired third-party Xbox pads such as the PDP Afterglow Wave: they show up as
 //! a vendor-class USB device (class 0xFF, interface subclass 0x47, protocol 0xD0) and no HID device is
 //! created, so games and the Game Controller framework never see them. This talks to the pad directly
-//! through the pure-Rust `nusb` crate (IOKit underneath). The packet layouts follow the Linux `xpad` driver.
+//! through the pure-Rust `nusb` crate (IOKit underneath).
+//!
+//! Provenance: this protocol code was written by an AI (Claude) from its general knowledge of GIP and of
+//! the Linux `xpad` and `xone` drivers, without reading their source at the time, then checked against
+//! a real PDP pad and afterwards against Microsoft's MS-GIPUSB specification. No source text was copied.
+//! The README lists which facts the specification states and which were found only on hardware.
 //!
 //! GIP packets start with a 4-byte header: command, options, sequence number, payload length.
 //! - Host to pad, to start input: power on (0x05), and for PDP pads also LED on (0x0A) and the
-//!   authentication-done notice (0x06).
+//!   security-state packet (0x06) that the pad waits for.
 //! - Pad to host: input (0x20) with buttons, triggers and sticks; the guide button (0x07), which asks
 //!   for an acknowledgement when its options carry 0x10.
 
@@ -174,29 +179,29 @@ impl Header {
     }
 }
 
-/// The pad's announce packet (0x02): who it is and its firmware and hardware versions.
+/// The pad's announce packet (0x02, "Hello Device"): who it is and its versions.
+///
+/// The 28-byte payload follows MS-GIPUSB Table 27 (section 3.1.5.5.1): an 8-byte device ID, vendor and
+/// product IDs, four 16-bit firmware fields (major, minor, build, revision), then four 2-byte
+/// major.minor pairs of one byte each: hardware, RF protocol, security protocol and GIP version.
 pub fn describe_announce(body: &[u8]) -> Option<String> {
     if body.len() < 28 {
         return None;
     }
     let u16le = |i: usize| u16::from_le_bytes([body[i], body[i + 1]]);
-    let version = |i: usize| {
-        format!(
-            "{}.{}.{}.{}",
-            u16le(i),
-            u16le(i + 2),
-            u16le(i + 4),
-            u16le(i + 6)
-        )
-    };
+    let firmware = format!("{}.{}.{}.{}", u16le(12), u16le(14), u16le(16), u16le(18));
+    let pair = |i: usize| format!("{}.{}", body[i], body[i + 1]);
     let address: Vec<String> = body[..6].iter().rev().map(|b| format!("{b:02x}")).collect();
     Some(format!(
-        "address {} vendor {:04x} product {:04x} firmware {} hardware {}",
+        "address {} vendor {:04x} product {:04x} firmware {} hardware {} rf {} security {} gip {}",
         address.join(":"),
         u16le(8),
         u16le(10),
-        version(12),
-        version(20)
+        firmware,
+        pair(20),
+        pair(22),
+        pair(24),
+        pair(26)
     ))
 }
 
@@ -265,8 +270,9 @@ impl Gip {
     }
 
     /// Acknowledges a packet whose options ask for it. The ack carries the acknowledged packet's
-    /// sequence number, and for chunked transfers how many bytes have arrived and how many remain
-    /// (xone's `gip_pkt_acknowledge`).
+    /// sequence number, and for chunked transfers how many bytes have arrived and how many remain.
+    /// The payload layout was confirmed on hardware; MS-GIPUSB gives only the packet's type, flags
+    /// and length (Table 26).
     pub fn ack(&mut self, h: &Header, received: u16, remaining: u16) -> Result<()> {
         let [r0, r1] = received.to_le_bytes();
         let [m0, m1] = remaining.to_le_bytes();
@@ -569,7 +575,7 @@ impl Controller {
             .map_or_else(|| "?".into(), str::to_string);
         gip.send(CMD_POWER, OPT_INTERNAL, &[0x00])?;
         if found.vendor == PDP_VENDOR {
-            // PDP pads stay silent until they get these (xpad: xboxone_pdp_led_on, xboxone_pdp_auth)
+            // This PDP pad stays silent until it gets these two (found on hardware)
             gip.send(CMD_LED, OPT_INTERNAL, &[0x00, 0x01, 0x14])?;
             gip.send(CMD_AUTHENTICATE, OPT_INTERNAL, &[0x01, 0x00])?;
         }
@@ -749,12 +755,41 @@ mod tests {
         ];
         assert_eq!(
             describe_announce(&body).unwrap(),
-            "address 01:02:03:04:05:06 vendor 0e6f product 0338 firmware 2.0.3.0 hardware 2.1.1.1"
+            "address 01:02:03:04:05:06 vendor 0e6f product 0338 firmware 2.0.3.0 hardware 2.0 rf 1.0 security 1.0 gip 1.0"
         );
         assert_eq!(
             strings(b"\x1a\x00Windows.Xbox.Input.Gamepad\x1b\x00ab", 6),
             ["Windows.Xbox.Input.Gamepad"]
         );
+    }
+
+    #[test]
+    fn announce_from_the_pdp_pad_reads_hardware_and_protocol_versions() {
+        // The hardware version bytes the connected PDP pad (0e6f:0338) sends: `02 00 01 00 01 00 01 00`.
+        // MS-GIPUSB Table 27 makes them four major.minor byte pairs (hardware 2.0, RF 1.0, security 1.0,
+        // GIP 1.0), not four 16-bit numbers.
+        let mut p = vec![0x02, 0x20, 0x01, 0x1C];
+        p.extend([
+            0x06, 0x05, 0x04, 0x03, 0x02, 0x01, 0x00, 0x00, // device ID
+            0x6F, 0x0E, 0x38, 0x03, // vendor 0e6f, product 0338
+            0x02, 0x00, 0x00, 0x00, 0x03, 0x00, 0x00, 0x00, // firmware 2.0.3.0
+            0x02, 0x00, 0x01, 0x00, 0x01, 0x00, 0x01, 0x00, // hardware, RF, security, GIP
+        ]);
+        let h = Header::parse(&p).unwrap();
+        let text = describe_announce(h.body(&p)).unwrap();
+        assert!(
+            text.ends_with("hardware 2.0 rf 1.0 security 1.0 gip 1.0"),
+            "{text}"
+        );
+        assert!(!text.contains("2.1.1.1"));
+        // Each of the eight bytes is its own field, so a minor version above 0 stays one byte
+        let mut body = h.body(&p).to_vec();
+        body[20..28].copy_from_slice(&[3, 7, 1, 0, 1, 2, 1, 3]);
+        assert!(describe_announce(&body)
+            .unwrap()
+            .ends_with("hardware 3.7 rf 1.0 security 1.2 gip 1.3"));
+        // Shorter than the 28-byte payload of Table 27
+        assert!(describe_announce(&body[..27]).is_none());
     }
 
     #[test]
