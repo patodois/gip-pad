@@ -72,21 +72,24 @@ pub const BUTTONS: [(u16, &str); 14] = [
 ];
 
 impl Pad {
-    /// Applies an input report (command 0x20); returns false if it is too short.
+    /// Applies an input report (command 0x20); returns false for an incomplete or fragmented report.
     pub fn apply_input(&mut self, p: &[u8]) -> bool {
-        if p.len() < 18 {
+        let Some(h) = Header::parse(p) else {
+            return false;
+        };
+        if h.command != CMD_INPUT || h.chunk.is_some() || h.length < 14 {
             return false;
         }
+        let p = h.body(p);
         let u16le = |i: usize| u16::from_le_bytes([p[i], p[i + 1]]);
         let i16le = |i: usize| i16::from_le_bytes([p[i], p[i + 1]]);
-        self.buttons = u16le(4);
-        self.left_trigger = u16le(6);
-        self.right_trigger = u16le(8);
-        self.left_stick = (i16le(10), i16le(12));
-        self.right_stick = (i16le(14), i16le(16));
-        // Series-era pads send a longer report with the Share button; on the PDP Afterglow Wave
-        // (payload 0x2E) it is bit 0 of byte 32
-        self.share = p.len() > 32 && p[3] >= 0x2E && p[32] & 1 != 0;
+        self.buttons = u16le(0);
+        self.left_trigger = u16le(2);
+        self.right_trigger = u16le(4);
+        self.left_stick = (i16le(6), i16le(8));
+        self.right_stick = (i16le(10), i16le(12));
+        // The Share flag is payload byte 28 in Series-era reports.
+        self.share = h.length >= 0x2E && p[28] & 1 != 0;
         true
     }
 
@@ -825,5 +828,35 @@ mod tests {
         p[3] = 0x0E;
         assert!(pad.apply_input(&p));
         assert!(pad.pressed().is_empty());
+    }
+}
+
+#[cfg(test)]
+mod input_header_regression {
+    use super::*;
+    #[test]
+    fn incomplete_input_does_not_change_state() {
+        let mut pad = Pad {
+            buttons: 123,
+            ..Pad::default()
+        };
+        let mut p = vec![0x20, 0, 1, 46];
+        p.extend_from_slice(&[0; 14]);
+        assert!(!pad.apply_input(&p));
+        assert_eq!(pad.buttons, 123);
+    }
+    #[test]
+    fn extended_input_length_keeps_payload_offsets() {
+        let mut pad = Pad::default();
+        let mut p = vec![0x20, 0, 1, 0x8e, 0];
+        p.extend_from_slice(&[16, 0, 12, 0, 23, 0, 34, 0, 45, 0, 56, 0, 67, 0]);
+        assert!(pad.apply_input(&p));
+        assert_eq!(pad.buttons, 16);
+        assert_eq!(pad.left_trigger, 12);
+        assert_eq!(pad.right_trigger, 23);
+        assert_eq!(pad.left_stick, (34, 45));
+        assert_eq!(pad.right_stick, (56, 67));
+        p[1] = OPT_CHUNK;
+        assert!(!pad.apply_input(&p));
     }
 }
