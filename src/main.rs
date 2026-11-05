@@ -163,13 +163,12 @@ fn info() -> Result<()> {
             (0x04, Some(total)) if h.options & OPT_CHUNK_START != 0 => {
                 metadata = vec![0; total];
                 metadata[..body.len().min(total)].copy_from_slice(&body[..body.len().min(total)]);
-                received = body.len();
+                received = body.len().min(total);
             }
             (0x04, Some(offset))
                 if !metadata.is_empty() && offset + body.len() <= metadata.len() =>
             {
-                metadata[offset..offset + body.len()].copy_from_slice(body);
-                received = received.max(offset + body.len());
+                store_metadata_chunk(&mut metadata, &mut received, offset, body);
             }
             _ => {}
         }
@@ -255,5 +254,29 @@ mod tests {
         assert_eq!(bcd(0x0110), "1.1.0");
         assert_eq!(bcd(0x0321), "3.2.1");
         assert_eq!(bcd(0x1234), "12.3.4");
+    }
+}
+
+fn store_metadata_chunk(metadata: &mut [u8], received: &mut usize, offset: usize, body: &[u8]) {
+    if offset <= *received {
+        metadata[offset..offset + body.len()].copy_from_slice(body);
+        *received = (*received).max(offset + body.len());
+    }
+}
+
+#[cfg(test)]
+mod metadata_regression {
+    use super::*;
+    #[test]
+    fn metadata_gaps_do_not_count_as_received() {
+        let mut b = vec![b'A', b'B', 0, 0, 0, 0];
+        let mut n = 2;
+        store_metadata_chunk(&mut b, &mut n, 4, b"EF");
+        assert_eq!(n, 2);
+        store_metadata_chunk(&mut b, &mut n, 2, b"CD");
+        assert_eq!(n, 4);
+        store_metadata_chunk(&mut b, &mut n, 4, b"EF");
+        assert_eq!(n, 6);
+        assert_eq!(b, b"ABCDEF");
     }
 }
