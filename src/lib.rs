@@ -857,6 +857,63 @@ mod input_header_regression {
         assert_eq!(pad.left_stick, (34, 45));
         assert_eq!(pad.right_stick, (56, 67));
         p[1] = OPT_CHUNK;
+        p.insert(5, 0);
+        assert!(Header::parse(&p).is_some());
         assert!(!pad.apply_input(&p));
+    }
+}
+
+#[cfg(test)]
+mod input_guard_coverage {
+    use super::*;
+    fn packet(command: u8, length: u8) -> Vec<u8> {
+        let mut p = vec![command, 0, 1, length];
+        p.resize(4 + usize::from(length), 0);
+        p
+    }
+    #[test]
+    fn parsed_non_input_commands_leave_state_unchanged() {
+        let p = packet(0x21, 14);
+        assert!(Header::parse(&p).is_some());
+        let mut pad = Pad {
+            buttons: 123,
+            ..Pad::default()
+        };
+        assert!(!pad.apply_input(&p));
+        assert_eq!(pad.buttons, 123);
+    }
+    #[test]
+    fn parsed_short_payloads_are_refused_before_field_reads() {
+        let p = packet(CMD_INPUT, 13);
+        assert!(Header::parse(&p).is_some());
+        let mut pad = Pad {
+            buttons: 123,
+            ..Pad::default()
+        };
+        assert!(!pad.apply_input(&p));
+        assert_eq!(pad.buttons, 123);
+    }
+    #[test]
+    fn parsed_chunks_are_refused_even_with_a_complete_payload() {
+        let mut p = vec![CMD_INPUT, OPT_CHUNK, 1, 14, 0];
+        p.resize(19, 0);
+        assert_eq!(Header::parse(&p).unwrap().chunk, Some(0));
+        let mut pad = Pad {
+            buttons: 123,
+            ..Pad::default()
+        };
+        assert!(!pad.apply_input(&p));
+        assert_eq!(pad.buttons, 123);
+    }
+    #[test]
+    fn share_requires_the_long_report_not_just_byte_28() {
+        let mut pad = Pad::default();
+        for (length, expected) in [(29, false), (46, true)] {
+            let mut p = packet(CMD_INPUT, length);
+            p[4 + 28] = 1;
+            assert!(Header::parse(&p).is_some());
+            assert!(pad.apply_input(&p));
+            assert_eq!(pad.share, expected);
+        }
     }
 }

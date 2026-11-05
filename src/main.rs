@@ -161,9 +161,7 @@ fn info() -> Result<()> {
                 }
             }
             (0x04, Some(total)) if h.options & OPT_CHUNK_START != 0 => {
-                metadata = vec![0; total];
-                metadata[..body.len().min(total)].copy_from_slice(&body[..body.len().min(total)]);
-                received = body.len().min(total);
+                (metadata, received) = start_metadata(total, body);
             }
             (0x04, Some(offset))
                 if !metadata.is_empty() && offset + body.len() <= metadata.len() =>
@@ -278,5 +276,22 @@ mod metadata_regression {
         store_metadata_chunk(&mut b, &mut n, 4, b"EF");
         assert_eq!(n, 6);
         assert_eq!(b, b"ABCDEF");
+    }
+}
+
+fn start_metadata(total: usize, body: &[u8]) -> (Vec<u8>, usize) {
+    let mut metadata = vec![0; total];
+    metadata[..body.len().min(total)].copy_from_slice(&body[..body.len().min(total)]);
+    let received = body.len().min(total);
+    (metadata, received)
+}
+#[cfg(test)]
+mod first_metadata_coverage {
+    use super::*;
+    #[test]
+    fn first_chunk_count_is_clamped_to_the_announced_total() {
+        let (bytes, received) = start_metadata(2, b"ABCDEF");
+        assert_eq!(bytes, b"AB");
+        assert_eq!(received, 2);
     }
 }
