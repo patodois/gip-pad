@@ -36,6 +36,11 @@ Rules (ids as printed):
   foreign-copyright  a copyright holder that is neither us nor named in NOTICE / THIRD_PARTY_NOTICES
   secret-content     crates.io and GitHub tokens, private keys, cloud and API keys (never printed in full)
 
+Commit messages (and annotated tag messages, in --history) are scanned for secrets too. A text that holds a NUL, or starts
+with a UTF-16 byte-order mark, is also read as UTF-16 (what PowerShell 5's `>` writes), and the raw bytes of binaries up to
+SCAN_CAP are searched for markers and secrets. Not covered, by design of matching by extension and size: a game archive with an
+unlisted extension and a small archive (.zip) holding source; binaries over SCAN_CAP are never read.
+
 Per-repository extension: `.public-tree.cfg` (one directive per line, `#` starts a comment):
   private_root NAME | private_dir NAME | private_ext .EXT | private_name GLOB | private_path GLOB
   source_ext .EXT        another extension that counts as foreign source
@@ -65,7 +70,7 @@ KIB = 1024
 MIB = 1024 * KIB
 DEFAULT_MAX_BINARY = 256 * KIB
 DEFAULT_MAX_TEXT = 2 * MIB
-SCAN_CAP = 1 * MIB          # content rules read at most this much of a blob; bigger blobs hit the size rules
+SCAN_CAP = 1 * MIB          # always inspect small blobs; accepted larger text is scanned up to its limit
 BINARY_PROBE = 8000
 HEADER_LINES = 60           # copyright headers are looked for in the first lines of a file
 CHUNK_BYTES = 32 * MIB      # blobs are read in batches of at most this many bytes (RAM bound)
@@ -95,7 +100,9 @@ SECRET_FILE_NAMES = {".env", ".env.*", "id_rsa", "id_dsa", "id_ecdsa", "id_ed255
 SECRET_FILE_OK = {".env.example", ".env.sample", ".env.template"}
 LICENSE_NAMES = ("license", "licence", "copying", "notice", "third_party", "third-party", "authors", "copyright")
 NOTICE_NAMES = ("notice", "third_party", "third-party", "thirdparty", "notices")
-GAME_PACKAGE_RE = re.compile(r"^\s*package\s+(?:net\.minecraft|com\.mojang|net\.minecraftforge|cpw\.mods)\b", re.M)
+# A byte-order mark, white space and block comments may come before the declaration on its line
+GAME_PACKAGE_RE = re.compile(r"^[\s\ufeff]*(?:/\*.*?\*/[\s\ufeff]*)*package\s+"
+                             r"(?:net\.minecraft|com\.mojang|net\.minecraftforge|cpw\.mods)\b", re.M | re.S)
 GAME_PACKAGE_EXTS = (".java", ".kt", ".scala", ".groovy")
 
 MARKERS = [
@@ -258,6 +265,9 @@ class Rules(object):
                         raise GateError("%s: unknown option %r" % (where, token))
                 if not glob:
                     raise GateError("%s: empty glob" % where)
+                if content and not blobs:
+                    raise GateError("%s: a content: entry needs blob= (without it any later change to the file keeps "
+                                    "the exemption)" % where)
                 self.allows.append(Allow(glob, content, max_bytes, blobs, reason, number))
 
     def allow_for(self, path, blob, content):
@@ -273,7 +283,10 @@ class Git(object):
 
     def run(self, args, stdin=None, check=True):
         # --no-replace-objects: Git pushes the stored objects, not the history that local replace refs present.
-        cmd = ["git", "--no-replace-objects", "-C", self.repo] + list(args)
+        # -c: the user's own Git configuration must not change what is audited (log.showRoot=false hides the
+        # root commit, log.showSignature adds lines to the output)
+        cmd = ["git", "--no-replace-objects", "-c", "log.showRoot=true", "-c", "log.showSignature=false",
+               "-C", self.repo] + list(args)
         try:
             done = subprocess.run(cmd, input=stdin, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=self.env)
         except OSError as error:
@@ -330,6 +343,23 @@ class Git(object):
                 found.append((path, fields[3], fields[1], commit))
         return found
 
+    def messages(self, revs, tags):
+        """(label, text, commit) for the message of every commit in `revs` and, with `tags`, of annotated tags."""
+        found = []
+        if revs:
+            out = self.run(["log", "--format=%x01%H%x02%B", "--no-abbrev"] + revs + ["--"]).stdout
+            for chunk in out.decode("utf-8", "replace").split("\x01")[1:]:
+                sha, _, body = chunk.partition("\x02")
+                found.append(("(commit message %s)" % sha[:9], body, (sha, "", body.strip().split("\n", 1)[0])))
+        if tags:
+            out = self.run(["for-each-ref", "--format=%(objecttype)%02%(objectname)%02%(refname)%02%(contents)%01",
+                            "refs/tags"]).stdout
+            for chunk in out.decode("utf-8", "replace").split("\x01"):
+                fields = chunk.lstrip("\n").split("\x02", 3)
+                if len(fields) == 4 and fields[0] == "tag":
+                    found.append(("(tag message %s)" % fields[2], fields[3], (fields[1], "", fields[2])))
+        return found
+
     def sizes(self, shas):
         if not shas:
             return {}
@@ -369,9 +399,9 @@ def normalize(text):
     return " ".join(re.sub(r"[^a-z0-9]+", " ", text.lower()).split())
 
 
-def copyright_holders(text):
+def copyright_holders(text, lines=HEADER_LINES):
     found = []
-    for line in text.splitlines()[:HEADER_LINES]:
+    for line in text.splitlines()[:lines]:
         low = line.lower()
         if "copyright" not in low and "©" not in line and "(c)" not in low:
             continue
@@ -392,6 +422,40 @@ def copyright_holders(text):
 
 def is_binary(head):
     return b"\0" in head[:BINARY_PROBE]
+
+
+def text_views(data):
+    """(text, full) pairs to run the content rules on. The UTF-8 reading comes first, and `full` says whether it is
+    text (the holder and package rules are for text); a blob with a NUL anywhere, or a UTF-16 byte-order mark, is
+    read as UTF-16 of either byte order too, which is what Windows tools write and what no UTF-8 search can see."""
+    views = [(data.decode("utf-8", "replace").lstrip("\ufeff"), not is_binary(data))]
+    if b"\0" in data or data[:2] in (b"\xff\xfe", b"\xfe\xff"):
+        even = data[:len(data) // 2 * 2]
+        for codec in ("utf-16-le", "utf-16-be"):
+            views.append((even.decode(codec, "replace").lstrip("\ufeff"), True))
+    return views
+
+
+def blob_facts(rules, data):
+    """What the content rules find in a blob, whatever its path: markers, secrets, copyright holders, a game package."""
+    facts = {"marker": None, "secrets": [], "holders": [], "package": False}
+    for text, full in text_views(data):
+        if facts["marker"] is None:
+            for rx in rules.markers:
+                match = rx.search(text)
+                if match:
+                    facts["marker"] = match.group(0).strip()[:60]
+                    break
+        for name, rx in SECRETS:
+            match = rx.search(text)
+            if match:
+                entry = "%s (%s...)" % (name, match.group(0).strip()[:6])
+                if entry not in facts["secrets"]:
+                    facts["secrets"].append(entry)
+        if full:
+            facts["package"] = facts["package"] or bool(GAME_PACKAGE_RE.search(text))
+            facts["holders"].extend(h for h in copyright_holders(text) if h not in facts["holders"])
+    return facts
 
 
 def lfs_size(data):
@@ -442,22 +506,17 @@ def path_findings(rules, path):
     return found
 
 
-def content_findings(rules, path, text, holders_ok):
+def content_findings(rules, path, facts, holders_ok):
     found = []
-    for rx in rules.markers:
-        match = rx.search(text)
-        if match:
-            found.append(("decompiler-marker", match.group(0).strip()[:60]))
-            break
-    for name, rx in SECRETS:
-        match = rx.search(text)
-        if match:
-            found.append(("secret-content", "%s (%s...)" % (name, match.group(0).strip()[:6])))
+    if facts["marker"]:
+        found.append(("decompiler-marker", facts["marker"]))
+    for entry in facts["secrets"]:
+        found.append(("secret-content", entry))
     base = path.rsplit("/", 1)[-1].lower()
-    if path.lower().endswith(GAME_PACKAGE_EXTS) and GAME_PACKAGE_RE.search(text):
+    if path.lower().endswith(GAME_PACKAGE_EXTS) and facts["package"]:
         found.append(("game-package-decl", "declares a package inside the game"))
     if not base.startswith(LICENSE_NAMES) and not base.endswith(".lock"):
-        for holder in copyright_holders(text):
+        for holder in facts["holders"]:
             norm = normalize(holder)
             if norm and not any(len(ok) >= 3 and (ok in norm or norm in ok) for ok in holders_ok):
                 found.append(("foreign-copyright", holder))
@@ -465,7 +524,8 @@ def content_findings(rules, path, text, holders_ok):
 
 
 def holders_allowed(rules, repo):
-    """Our own names plus every NOTICE-like file at the top of the working tree (normalized)."""
+    """Our own names plus the holders named in the copyright lines of every NOTICE-like file at the top of the working
+    tree (normalized)."""
     ok = [normalize(h) for h in rules.own_holders]
     try:
         names = os.listdir(repo)
@@ -474,8 +534,13 @@ def holders_allowed(rules, repo):
     for name in names:
         full = os.path.join(repo, name)
         if name.lower().startswith(NOTICE_NAMES) and os.path.isfile(full) and os.path.getsize(full) <= 4 * MIB:
-            with open(full, encoding="utf-8", errors="replace") as handle:
-                ok.append(normalize(handle.read()))
+            with open(full, "rb") as handle:
+                raw = handle.read()
+            text = (raw.decode("utf-16", "replace") if raw[:2] in (b"\xff\xfe", b"\xfe\xff")
+                    else raw.decode("utf-8", "replace"))
+            # the holders the notice names in its copyright lines, one by one: a name that only appears in
+            # the prose of a notice ("not affiliated with ...") is not a holder it vouches for
+            ok.extend(normalize(h) for h in copyright_holders(text, lines=len(text.splitlines())))
     return [o for o in ok if o]
 
 
@@ -489,7 +554,7 @@ class Hit(object):
         self.blobs = {blob}
 
 
-def audit(git, rules, repo, entries):
+def audit(git, rules, repo, entries, messages=()):
     """Return (hits, allowed): lists of Hit; allowed ones carry .reason."""
     # one entry per (path, blob, mode); git log runs newest first, so the last one seen is the oldest commit.
     # Submodule links (mode 160000) hold no files.
@@ -524,19 +589,29 @@ def audit(git, rules, repo, entries):
         else:
             record(rule, path, detail, blob, size, commit)
 
-    # 1. content of the blobs small enough to read, once per blob
-    content_by_blob, lfs, binary = {}, {}, {}
-    small = [s for s in shas if sizes[s] <= SCAN_CAP]
-    paths_of = {}
+    # 1. Scan every accepted text blob completely, once per blob. Larger rejected text
+    # needs only a size finding; large binaries need only a classification probe. Explicit
+    # text limits and size allowances also extend scanning, not just acceptance.
+    facts_by_blob, lfs, binary = {}, {}, {}
+    scan_limits = {sha: rules.max_text for sha in shas}
     for path, sha, _mode, _commit in entries:
-        paths_of.setdefault(sha, set()).add(path)
-    for sha, data in git.read_blobs(small, sizes):
+        caps = [a.max_bytes for a in rules.allow_for(path, sha, False) if a.max_bytes is not None]
+        if caps:
+            scan_limits[sha] = max(scan_limits[sha], max(caps))
+    scan = []
+    for sha in shas:
+        if sizes[sha] <= SCAN_CAP:
+            scan.append(sha)
+        else:
+            binary[sha] = is_binary(git.probe(sha, BINARY_PROBE))
+            if not binary[sha] and sizes[sha] <= scan_limits[sha]:
+                scan.append(sha)
+    for sha, data in git.read_blobs(scan, sizes):
         declared = lfs_size(data)
         if declared is not None:
             lfs[sha] = declared
         binary[sha] = is_binary(data)
-        if not binary[sha]:
-            content_by_blob[sha] = data.decode("utf-8", "replace")
+        facts_by_blob[sha] = blob_facts(rules, data)
 
     # 2. every (path, blob) pair
     for path, sha, mode, commit in entries:
@@ -565,10 +640,17 @@ def audit(git, rules, repo, entries):
                     record(kind, path, "%d bytes > allowed %d" % (real, max(caps)), sha, real, commit)
                 else:
                     record(kind, path, detail, sha, real, commit)
-        text = content_by_blob.get(sha)
-        if text is not None:
-            for rule, detail in content_findings(rules, path, text, holders_ok):
+        facts = facts_by_blob.get(sha)
+        if facts is not None:
+            for rule, detail in content_findings(rules, path, facts, holders_ok):
                 route(rule, path, detail, sha, size, commit, True)
+    # 3. commit and tag messages: secrets only
+    for label, text, commit in messages:
+        for name, rx in SECRETS:
+            match = rx.search(text)
+            if match:
+                route("secret-content", label, "%s (%s...)" % (name, match.group(0).strip()[:6]), commit[0], len(text),
+                      commit, True)
     return sorted(hits.values(), key=lambda h: (h.rule, h.path)), sorted(allowed.values(), key=lambda h: (h.rule, h.path))
 
 
@@ -653,16 +735,20 @@ def main(argv=None):
             revs = ["--all"] + (["HEAD"] if git.run(["rev-parse", "-q", "--verify", "HEAD"], check=False).returncode == 0
                                 else [])
             entries = git.entries_history(revs)
+            messages = git.messages(revs, tags=True)
         elif args.range:
             revs = shlex.split(args.range)
             if not revs or any(r.startswith("-") for r in revs):
                 raise GateError("--range takes revisions only")
             entries = git.entries_history(revs)
+            messages = git.messages(revs, tags=False)
         elif args.pre_push:
-            entries = git.entries_history(pushed(sys.stdin, git))
+            revs = pushed(sys.stdin, git)
+            entries = git.entries_history(revs)
+            messages = git.messages(revs, tags=False)
         else:
-            entries = git.entries_index()
-        hits, allowed = audit(git, rules, top, entries)
+            entries, messages = git.entries_index(), []
+        hits, allowed = audit(git, rules, top, entries, messages)
     except GateError as error:
         sys.stderr.write("check_public_tree: %s\n" % error)
         return 2
