@@ -78,9 +78,32 @@ cargo build --release
 ./target/release/gip-pad --info     # USB descriptors, firmware, hardware and protocol versions, metadata
 ```
 
-`--info` resets the pad so it announces itself again, then reads its metadata. The reader finds
-the first interface with the GIP class and its interrupt endpoints, so other GIP pads should work
-too. Only PDP pads (vendor 0x0e6f) get the PDP start-up packets.
+`Controller::open()` and `--info` reset USB and reopen the same bus/port/VID/PID, allowing
+up to three seconds for re-enumeration, then up to 1500 ms for announce. If reset is unsupported,
+opening continues without reset. If announce times out, the existing packets are still sent.
+`--info` responds with Metadata Request; `Controller::open()` responds with START and, for PDP
+pads (vendor 0x0e6f), the existing LED and security packets.
+
+The library writes no startup diagnostics to stderr. Call `Controller::announced()` or
+`Controller::startup_status()` to inspect the result; the CLI prints its own warnings.
+Use `Controller::open_without_reset()` or `PadReader::spawn_without_reset()` for the 0.2.3
+opening behavior, without reset or an announce wait, including after replug in the reader.
+This behavior change is released as **0.3.0**.
+
+`PadReader::spawn()` performs at most one reset per physical connection. A reset refused before
+it takes place leaves that reset available for the next attempt. After a performed reset, failed
+reopening retries without another reset. Retry delays are 1, 2, 4 and then at most 8 seconds;
+a successful opening clears the backoff even when no input report has arrived. USB re-enumeration
+caused by its own reset is kept in the same connection; a later physical reconnect allows a
+new reset. Silence alone does not cause a reset, because unchanged input need not be sent.
+If the device has not reappeared after reset, the reader conservatively treats its next
+appearance as that pending reset until it can identify the replacement USB instance.
+Reset reopening filters bus, port, VID and PID before descriptor inspection, so it only opens
+the original device and retains that device's access error.
+
+Closing an app while opening the pad, including dropping `PadReader`, can take several seconds:
+USB reset/reopening, the announce wait and pending USB writes must finish before its thread
+joins. Retry backoff sleeps check for shutdown every 100 ms.
 
 The USB layer is the pure-Rust `nusb` crate (IOKit underneath, no C library), so nothing else needs installing. If
 another program holds the pad, opening it may fail; close that program and try again.
@@ -119,6 +142,35 @@ The check only reads the registry. Beyond the descriptor reads of `--info`, no r
 `find_gip()` skips these pads and returns a `gip_pad::owner::SystemOwned` error (downcast it from the
 `anyhow::Error`) when only such pads are present; `find_gip_any()` also returns them, marked, for
 inspection. On other platforms no owner is ever reported.
+
+## Changes
+
+### 0.3.0
+
+- Add `Controller::open_without_reset()`, `PadReader::spawn_without_reset()`, `announced()` and
+  `startup_status()`. Keep startup
+  diagnostics in the CLI, and continue with the legacy sequence when USB reset is unsupported.
+- Count only performed resets against the connection budget, including failed or slow reopening.
+  Retry refused resets with capped backoff; clear the backoff on successful opening and allow a
+  new reset after physical reconnect. Check shutdown during retry waits.
+- Filter the original bus/port/VID/PID before opening descriptors and preserve the first GIP error.
+- Validate Hello's nonzero sequence and Device ID high bytes (MS-GIPUSB section 3.1.5.5.1,
+  Table 27). That table specifies flags 0x20 and 28 payload bytes. Accepting ACME and extra
+  trailing Hello bytes is a local compatibility tolerance; requested ACK uses section 3.1.5.1.
+  Larger fragmented messages are described in section 3.1.5.2 (MTU sizes in 2.2.10.4);
+  the Hello parser rejects fragments. The CLI prints each accepted announce once.
+- Exercise controller opening, the reader thread and diagnostics through fake USB/time boundaries;
+  add reproducible mutation checks for reset, port/VID/PID filtering, the reopen window and metadata.
+- Package only crate sources, README, manifests and licenses.
+
+### 0.2.4
+
+- Reset and wait for announce on every controller open, recovering pads left in an old state after
+  sleep or an earlier program. The library and `--info` share the reset/reopen/announce path.
+- Keep startup working when announce times out; log the reason and send the existing start packets.
+- Do not reset an already opened pad merely because input is quiet: MS-GIPUSB section 3.1.5.6.1.1
+  recommends sending input only when a field changes. `PadReader` uses the reset on each open.
+- Add hardware-free transport tests for stale pads, announce timeout, malformed packets and errors.
 
 ## How it works
 

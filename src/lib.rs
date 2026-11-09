@@ -16,14 +16,18 @@
 //! - Pad to host: input (0x20) with buttons, triggers and sticks; the guide button (0x07), which asks
 //!   for an acknowledgement when its options carry 0x10.
 
+mod connection;
 pub mod owner;
+mod startup;
+
+pub use startup::{StartupStatus, Transport};
 
 use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
 use nusb::descriptors::TransferType;
-use nusb::transfer::{Buffer, Direction, In, Interrupt, Out};
-use nusb::{DeviceInfo, Endpoint, Interface, MaybeFuture};
+use nusb::transfer::{Direction, In, Interrupt, Out};
+use nusb::{DeviceInfo, MaybeFuture};
 
 use owner::{blocker, Blocker, Owner, SystemOwned};
 
@@ -158,6 +162,12 @@ pub fn varint(p: &[u8], pos: &mut usize) -> Option<usize> {
 }
 
 impl Header {
+    /// Checks the Hello prefix and Device ID in this packet (MS-GIPUSB 3.1.5.5.1, Table 27).
+    /// ACME and trailing Hello bytes are accepted as local compatibility tolerances.
+    pub fn is_announce(&self, packet: &[u8]) -> bool {
+        startup::is_announce(self, packet)
+    }
+
     pub fn parse(p: &[u8]) -> Option<Self> {
         let (&command, &options, &sequence) = (p.first()?, p.get(1)?, p.get(2)?);
         let mut pos = 3;
@@ -226,10 +236,7 @@ pub fn strings(data: &[u8], min: usize) -> Vec<String> {
 }
 
 pub struct Gip {
-    // Held so the claimed interface outlives the endpoints
-    _interface: Interface,
-    reader: Endpoint<Interrupt, In>,
-    writer: Endpoint<Interrupt, Out>,
+    io: Box<dyn connection::PacketIo>,
     /// Endpoint addresses
     pub ep_in: u8,
     pub ep_out: u8,
@@ -247,29 +254,12 @@ impl Gip {
 
     /// Writes one raw packet to the interrupt OUT endpoint, waiting up to 500 ms.
     pub fn write(&mut self, packet: &[u8]) -> Result<()> {
-        let mut buf = Buffer::new(packet.len());
-        buf.extend_from_slice(packet);
-        let done = self
-            .writer
-            .transfer_blocking(buf, Duration::from_millis(500));
-        done.status?;
-        Ok(())
+        self.io.write(packet)
     }
 
-    /// Waits up to `timeout` for one packet from the interrupt IN endpoint; `None` on a timeout.
-    /// The next read is queued as soon as one arrives, so no report is missed between calls.
+    /// Waits up to `timeout` for one packet; `None` on timeout.
     pub fn read(&mut self, timeout: Duration) -> Result<Option<Vec<u8>>> {
-        if self.reader.pending() == 0 {
-            let size = self.reader.max_packet_size().max(1);
-            self.reader.submit(Buffer::new(size));
-        }
-        let Some(done) = self.reader.wait_next_complete(timeout) else {
-            return Ok(None);
-        };
-        let size = self.reader.max_packet_size().max(1);
-        self.reader.submit(Buffer::new(size));
-        done.status?;
-        Ok(Some(done.buffer[..done.actual_len].to_vec()))
+        self.io.read(timeout)
     }
 
     /// Acknowledges a packet whose options ask for it. The ack carries the acknowledged packet's
@@ -319,6 +309,7 @@ impl Gip {
 }
 
 /// A GIP interface found on a USB device, not yet opened.
+#[derive(Clone)]
 pub struct Found {
     pub info: DeviceInfo,
     pub vendor: u16,
@@ -409,11 +400,21 @@ pub fn find_gip_any() -> Result<Detected> {
 }
 
 fn scan(include_system: bool) -> Result<Detected> {
+    inspect_devices(
+        include_system,
+        nusb::list_devices().wait().context("listing USB devices")?,
+    )
+}
+
+fn inspect_devices(
+    include_system: bool,
+    devices: impl IntoIterator<Item = DeviceInfo>,
+) -> Result<Detected> {
     let mut unreadable: Vec<String> = Vec::new();
     // Pads a system driver holds; the first one decides the error if nothing else turns up
     let mut held: Vec<SystemOwned> = Vec::new();
     let mut held_found: Option<Detected> = None;
-    for info in nusb::list_devices().wait().context("listing USB devices")? {
+    for info in devices {
         let listed: Vec<(u8, u8, u8)> = info
             .interfaces()
             .map(|i| (i.class(), i.subclass(), i.protocol()))
@@ -498,6 +499,20 @@ fn scan(include_system: bool) -> Result<Detected> {
 }
 
 impl Found {
+    /// Reset and reopen this device, then wait for Hello Device (MS-GIPUSB 3.1.5.5.1).
+    /// Returns startup status without writing diagnostics. The caller answers with START or metadata.
+    pub fn reset_and_wait(
+        &self,
+        device: nusb::Device,
+        on_packet: impl FnMut(&[u8]),
+    ) -> Result<(Gip, StartupStatus)> {
+        let candidate = connection::Candidate::from_found(self.clone());
+        let mut backend = connection::UsbBackend::with_handle(device);
+        let mut performed = false;
+        connection::reset_and_wait(&mut backend, &candidate, on_packet, &mut performed)
+            .map(|(gip, status, _)| (gip, status))
+    }
+
     /// Turns a failure to open or claim this pad into the error to report: [`SystemOwned`] if a macOS
     /// driver holds it, otherwise the error with a hint that fits what is known about the holder.
     pub fn explain_error(&self, e: nusb::Error, what: String) -> anyhow::Error {
@@ -546,9 +561,11 @@ impl Found {
             .endpoint::<Interrupt, Out>(self.ep_out)
             .with_context(|| format!("opening endpoint {:#04x}", self.ep_out))?;
         let gip = Gip {
-            _interface: interface,
-            reader,
-            writer,
+            io: Box::new(connection::UsbIo {
+                _interface: interface,
+                reader,
+                writer,
+            }),
             ep_in: self.ep_in,
             ep_out: self.ep_out,
             seq: 0,
@@ -564,31 +581,62 @@ pub struct Controller {
     pub vendor: u16,
     pub product: u16,
     pad: Pad,
+    startup: StartupStatus,
+    instance: String,
 }
 
 impl Controller {
-    /// Finds the first GIP pad, claims it and sends the start packets (and the PDP ones for PDP
-    /// pads), so it begins sending input.
+    /// Opens with one USB reset, up to 3 s of reopen attempts and a 1500 ms Hello wait.
+    /// An absent Hello or unsupported reset does not prevent the existing startup sequence.
     pub fn open() -> Result<Self> {
-        let found = find_gip()?;
-        let (_device, mut gip) = found.open()?;
-        let name = found
-            .info
-            .product_string()
-            .map_or_else(|| "?".into(), str::to_string);
-        gip.send(CMD_POWER, OPT_INTERNAL, &[0x00])?;
-        if found.vendor == PDP_VENDOR {
-            // This PDP pad stays silent until it gets these two (found on hardware)
-            gip.send(CMD_LED, OPT_INTERNAL, &[0x00, 0x01, 0x14])?;
-            gip.send(CMD_AUTHENTICATE, OPT_INTERNAL, &[0x01, 0x00])?;
-        }
+        connection::with_backend(|backend| Self::open_from(backend, true))
+    }
+
+    /// Opens with the 0.2.3 startup sequence, without USB reset or an announce wait.
+    pub fn open_without_reset() -> Result<Self> {
+        connection::with_backend(|backend| Self::open_from(backend, false))
+    }
+
+    fn open_from(backend: &mut dyn connection::Backend, reset: bool) -> Result<Self> {
+        let found = connection::first(backend)?;
+        Self::open_candidate(backend, &found, reset, &mut false)
+    }
+
+    fn open_candidate(
+        backend: &mut dyn connection::Backend,
+        found: &connection::Candidate,
+        reset: bool,
+        performed: &mut bool,
+    ) -> Result<Self> {
+        let (mut gip, startup, instance) = if reset {
+            connection::reset_and_wait(backend, found, |_| {}, performed)?
+        } else {
+            (
+                backend.open(found)?,
+                StartupStatus::Skipped,
+                found.instance.clone(),
+            )
+        };
+        startup::send_start(&mut gip, found.port.vendor)?;
         Ok(Self {
             gip,
-            name,
-            vendor: found.vendor,
-            product: found.product,
+            name: found.name.clone(),
+            vendor: found.port.vendor,
+            product: found.port.product,
             pad: Pad::default(),
+            startup,
+            instance,
         })
+    }
+
+    /// Whether a valid Hello Device arrived during startup.
+    pub fn announced(&self) -> bool {
+        self.startup == StartupStatus::Announced
+    }
+
+    /// Announce/reset outcome; the library never writes startup messages to stderr.
+    pub fn startup_status(&self) -> StartupStatus {
+        self.startup
     }
 
     /// Waits up to `timeout` for one packet, acknowledges it if asked, and updates the state.
@@ -603,7 +651,9 @@ impl Controller {
         };
         if p.len() >= 4 {
             if p[1] & OPT_ACK_WANTED != 0 {
-                if let Some(h) = Header::parse(&p) {
+                if let Some(h) =
+                    Header::parse(&p).filter(|h| h.command != 0x02 || h.is_announce(&p))
+                {
                     self.gip.ack(&h, h.length as u16, 0)?;
                 }
             }
@@ -639,9 +689,10 @@ pub fn trigger(v: u16) -> f32 {
     (f32::from(v) / 1023.0).clamp(0.0, 1.0)
 }
 
-/// Reads a controller on its own thread, so a game loop can take the latest state without
-/// blocking. If no pad is found or it is unplugged, it keeps retrying every second and keeps the
-/// reason in [`PadReader::last_error`].
+/// Reads a controller on its own thread. Retries use exponential backoff capped at 8 s;
+/// each physical connection is reset at most once, even if reopening fails.
+/// Silence does not trigger reset (MS-GIPUSB 3.1.5.6.1.1: send input only on changes).
+/// Dropping during startup can wait several seconds for USB operations to finish.
 pub struct PadReader {
     latest: std::sync::Arc<std::sync::Mutex<Option<Pad>>>,
     error: std::sync::Arc<std::sync::Mutex<Option<String>>>,
@@ -651,35 +702,22 @@ pub struct PadReader {
 
 impl PadReader {
     pub fn spawn() -> Self {
-        use std::sync::atomic::Ordering;
+        Self::spawn_with_reset(true)
+    }
+
+    /// Reads with the legacy startup sequence, without resetting on initial connection or replug.
+    pub fn spawn_without_reset() -> Self {
+        Self::spawn_with_reset(false)
+    }
+
+    fn spawn_with_reset(reset_on_connect: bool) -> Self {
         let latest = std::sync::Arc::new(std::sync::Mutex::new(None));
         let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let error = std::sync::Arc::new(std::sync::Mutex::new(None));
         let (l, s, er) = (latest.clone(), stop.clone(), error.clone());
+        let mut backend = connection::new_backend();
         let thread = std::thread::spawn(move || {
-            while !s.load(Ordering::Relaxed) {
-                let mut c = match Controller::open() {
-                    Ok(c) => c,
-                    Err(e) => {
-                        *er.lock().unwrap() = Some(format!("{e:#}"));
-                        std::thread::sleep(Duration::from_secs(1));
-                        continue;
-                    }
-                };
-                *er.lock().unwrap() = None;
-                *l.lock().unwrap() = Some(c.state());
-                while !s.load(Ordering::Relaxed) {
-                    match c.poll(Duration::from_millis(100)) {
-                        Ok(Some(_)) => *l.lock().unwrap() = Some(c.state()),
-                        Ok(None) => {}
-                        Err(e) => {
-                            *er.lock().unwrap() = Some(format!("{e:#}"));
-                            break;
-                        }
-                    }
-                }
-                *l.lock().unwrap() = None;
-            }
+            connection::read_loop(&mut *backend, &l, &er, &s, reset_on_connect);
         });
         Self {
             latest,

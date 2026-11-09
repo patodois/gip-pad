@@ -1,6 +1,6 @@
 [package]
 name = "gip-pad"
-version = "0.2.3"
+version = "0.3.0"
 edition = "2021"
 description = "Reads Xbox One / Series controllers (GIP over USB) on macOS, which has no driver for wired third-party pads"
 license = "MIT OR Apache-2.0"
@@ -8,7 +8,7 @@ repository = "https://github.com/patodois/gip-pad"
 readme = "README.md"
 keywords = ["xbox", "gamepad", "controller", "usb", "macos"]
 categories = ["hardware-support", "os::macos-apis", "command-line-utilities"]
-exclude = [".github/"]
+include = ["Cargo.toml", "Cargo.lock", "README.md", "LICENSE-MIT", "LICENSE-APACHE", "src/**/*.rs"]
 
 [dependencies]
 nusb = "0.2.9"
