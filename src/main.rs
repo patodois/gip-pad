@@ -235,27 +235,100 @@ fn info(
     Ok(())
 }
 
+const HELP: &str = "\
+gip-pad: read a wired GIP (Xbox One / Series protocol) controller over USB
+
+Usage: gip-pad [--raw] [--seconds N] [--no-reset]
+       gip-pad --info [--raw] [--no-reset]
+       gip-pad --help
+
+  (no option)   show sticks, triggers and pressed buttons on one live line
+  --raw         print every packet in hex
+  --info        print the USB descriptors, then the pad's announce and metadata
+  --seconds N   stop reading after N seconds (default: until Ctrl+C)
+  --no-reset    open the pad without a USB reset, as 0.2.3 did
+  --help, -h    print this help; no USB device is touched
+
+Every mode except --help opens the first GIP pad found and sends it packets. Unless
+--no-reset is given, it first resets the pad over USB. Reading also starts the pad and
+rumbles it briefly.
+";
+
+/// What the command line asks for.
+#[derive(Debug, PartialEq)]
+enum Mode {
+    Help,
+    Info {
+        raw: bool,
+        reset: bool,
+    },
+    Read {
+        raw: bool,
+        seconds: Option<u64>,
+        reset: bool,
+    },
+}
+
+/// Parses the arguments without touching any device; unknown arguments are an error.
+fn parse_args(args: &[String]) -> Result<Mode> {
+    if args.iter().any(|a| a == "--help" || a == "-h") {
+        return Ok(Mode::Help);
+    }
+    let (mut info, mut raw, mut reset, mut seconds) = (false, false, true, None);
+    let mut args = args.iter();
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--info" => info = true,
+            "--raw" => raw = true,
+            "--no-reset" => reset = false,
+            "--seconds" => {
+                let value = args.next().context("--seconds needs a number of seconds")?;
+                seconds = Some(value.parse::<u64>().with_context(|| {
+                    format!("--seconds: {value:?} is not a whole number of seconds")
+                })?);
+            }
+            other => anyhow::bail!("unknown argument {other:?}; see gip-pad --help"),
+        }
+    }
+    if !info {
+        return Ok(Mode::Read {
+            raw,
+            seconds,
+            reset,
+        });
+    }
+    if seconds.is_some() {
+        anyhow::bail!("--seconds applies to reading, not to --info");
+    }
+    Ok(Mode::Info { raw, reset })
+}
+
 fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    let reset = !args.iter().any(|a| a == "--no-reset");
-    if args.iter().any(|a| a == "--info") {
-        let mut source = UsbInfo {
-            session: None,
-            origin: std::time::Instant::now(),
+    let (raw, seconds, reset) = match parse_args(&args)? {
+        Mode::Help => {
+            print!("{HELP}");
+            return Ok(());
+        }
+        Mode::Info { raw, reset } => {
+            let mut source = UsbInfo {
+                session: None,
+                origin: std::time::Instant::now(),
+                reset,
+            };
+            return info(
+                &mut source,
+                raw,
+                &mut std::io::stdout(),
+                &mut std::io::stderr(),
+            );
+        }
+        Mode::Read {
+            raw,
+            seconds,
             reset,
-        };
-        return info(
-            &mut source,
-            args.iter().any(|a| a == "--raw"),
-            &mut std::io::stdout(),
-            &mut std::io::stderr(),
-        );
-    }
-    let raw = args.iter().any(|a| a == "--raw");
-    let seconds: Option<u64> = args
-        .iter()
-        .position(|a| a == "--seconds")
-        .and_then(|i| args.get(i + 1)?.parse().ok());
+        } => (raw, seconds, reset),
+    };
 
     let mut c = if reset {
         Controller::open()?
@@ -300,7 +373,66 @@ fn main() -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::bcd;
+    use super::*;
+
+    fn parse(args: &[&str]) -> Result<Mode> {
+        parse_args(&args.iter().map(|a| a.to_string()).collect::<Vec<_>>())
+    }
+
+    #[test]
+    fn help_is_recognised_wherever_it_appears() {
+        for args in [
+            &["--help"][..],
+            &["-h"],
+            &["--raw", "--help"],
+            &["--bogus", "-h"],
+        ] {
+            assert_eq!(parse(args).unwrap(), Mode::Help, "{args:?}");
+        }
+        assert!(HELP.contains("--no-reset") && HELP.contains("--seconds"));
+    }
+
+    #[test]
+    fn only_known_arguments_are_accepted() {
+        for args in [
+            &["--bogus"][..],
+            &["-r"],
+            &["info"],
+            &["--seconds"],
+            &["--seconds", "abc"],
+            &["--seconds", "-1"],
+            &["--info", "--seconds", "5"],
+        ] {
+            assert!(parse(args).is_err(), "{args:?}");
+        }
+    }
+
+    #[test]
+    fn known_arguments_select_the_mode() {
+        assert_eq!(
+            parse(&[]).unwrap(),
+            Mode::Read {
+                raw: false,
+                seconds: None,
+                reset: true
+            }
+        );
+        assert_eq!(
+            parse(&["--raw", "--seconds", "5", "--no-reset"]).unwrap(),
+            Mode::Read {
+                raw: true,
+                seconds: Some(5),
+                reset: false
+            }
+        );
+        assert_eq!(
+            parse(&["--no-reset", "--info", "--raw"]).unwrap(),
+            Mode::Info {
+                raw: true,
+                reset: false
+            }
+        );
+    }
 
     #[test]
     fn usb_versions_print_like_libusb() {
