@@ -746,7 +746,13 @@ impl Controller {
 }
 
 /// A stick axis as -1..=1 (up and right positive), with values inside `dead` treated as 0.
+/// `dead` is clamped to 0..=0.99; a NaN dead zone counts as none.
 pub fn stick(v: i16, dead: f32) -> f32 {
+    let dead = if dead.is_nan() {
+        0.0
+    } else {
+        dead.clamp(0.0, 0.99)
+    };
     let x = (f32::from(v) / 32767.0).clamp(-1.0, 1.0);
     if x.abs() < dead {
         0.0
@@ -922,6 +928,22 @@ mod tests {
         assert_eq!(stick(-32768, 0.15), -1.0);
         assert!((stick(16384, 0.0) - 0.5).abs() < 1e-3);
         assert_eq!((trigger(0), trigger(1023)), (0.0, 1.0));
+    }
+
+    #[test]
+    fn dead_zones_outside_the_unit_range_are_clamped() {
+        // A dead zone of 1 or more would divide by zero; a negative one would amplify
+        for v in [i16::MIN, -1000, 0, 1000, i16::MAX] {
+            assert!(
+                stick(v, 1.0).is_finite() && stick(v, 1.0).abs() <= 1.0,
+                "{v}"
+            );
+            assert!(stick(v, 7.5).is_finite(), "{v}");
+            assert_eq!(stick(v, -0.5), stick(v, 0.0), "{v}");
+        }
+        assert_eq!(stick(32767, 1.0), 1.0);
+        assert_eq!(stick(32000, 1.0), 0.0);
+        assert_eq!(stick(16384, f32::NAN), stick(16384, 0.0));
     }
 
     struct Sink {
