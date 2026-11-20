@@ -107,38 +107,37 @@ mod tests {
     use crate::{Pad, CMD_INPUT};
     use std::collections::VecDeque;
 
-    trait Reset {
-        type Transport: Transport;
-        fn reset_and_open(self) -> Result<Self::Transport>;
-    }
     struct WallClock(std::time::Instant);
     impl Clock for WallClock {
         fn now(&self) -> Duration {
             self.0.elapsed()
         }
     }
-    fn reset_and_wait<R: Reset>(
-        reset: R,
+
+    /// Runs the production announce wait on a pad as a performed USB reset leaves it: after any
+    /// queued packets it sends Hello once, if `emit_announce`. The reset itself is tested through
+    /// the USB boundary in `connection_tests.rs`.
+    fn wait(
+        mut pad: StalePad,
         timeout: Duration,
         on_packet: impl FnMut(&[u8]),
-    ) -> Result<R::Transport> {
-        let mut transport = reset.reset_and_open()?;
-        wait_for_announce(
-            &mut transport,
-            &WallClock(std::time::Instant::now()),
-            timeout,
-            on_packet,
-        )?;
-        Ok(transport)
+    ) -> Result<(StalePad, StartupStatus)> {
+        if pad.emit_announce {
+            pad.packets.push_back(hello());
+        }
+        let clock = WallClock(std::time::Instant::now());
+        let status = wait_for_announce(&mut pad, &clock, timeout, on_packet)?;
+        Ok((pad, status))
     }
-    fn start<R: Reset>(reset: R, vendor: u16, timeout: Duration) -> Result<R::Transport> {
-        let mut transport = reset_and_wait(reset, timeout, |_| {})?;
-        send_start(&mut transport, vendor)?;
-        Ok(transport)
+
+    /// The announce wait followed by the production start sequence.
+    fn start(pad: StalePad, vendor: u16, timeout: Duration) -> Result<(StalePad, StartupStatus)> {
+        let (mut pad, status) = wait(pad, timeout, |_| {})?;
+        send_start(&mut pad, vendor)?;
+        Ok((pad, status))
     }
 
     struct StalePad {
-        reset: bool,
         started: bool,
         led: bool,
         authenticated: bool,
@@ -149,14 +148,12 @@ mod tests {
         timeouts: Vec<Duration>,
         continuous_traffic: bool,
         read_error: bool,
-        reset_error: bool,
         acks: Vec<(u8, u16, u16)>,
     }
 
     impl Default for StalePad {
         fn default() -> Self {
             Self {
-                reset: false,
                 started: false,
                 led: false,
                 authenticated: false,
@@ -167,7 +164,6 @@ mod tests {
                 timeouts: Vec::new(),
                 continuous_traffic: false,
                 read_error: false,
-                reset_error: false,
                 acks: Vec::new(),
             }
         }
@@ -181,23 +177,6 @@ mod tests {
             1, 0,
         ]);
         packet
-    }
-
-    impl Reset for StalePad {
-        type Transport = Self;
-
-        fn reset_and_open(mut self) -> Result<Self> {
-            if self.reset_error {
-                anyhow::bail!("fake USB reset failed");
-            }
-            assert!(!self.reset, "startup must reset exactly once");
-            self.reset = true;
-            self.trace.push("reset");
-            if self.emit_announce {
-                self.packets.push_back(hello());
-            }
-            Ok(self)
-        }
     }
 
     impl Transport for StalePad {
@@ -217,7 +196,7 @@ mod tests {
                 }
                 return Ok(Some(packet));
             }
-            if self.reset && self.started && self.led && self.authenticated {
+            if self.started && self.led && self.authenticated {
                 // A, Up; LT=512, RT=1023, both sticks moved (MS-GIPUSB Table 57).
                 let mut report = vec![CMD_INPUT, 0, 1, 14, 16, 1];
                 report.extend_from_slice(&[0, 2, 255, 3, 1, 0, 2, 0, 3, 0, 4, 0]);
@@ -262,11 +241,13 @@ mod tests {
 
     #[test]
     fn stale_pad_delivers_input_after_open() {
-        let mut transport = start(StalePad::default(), PDP_VENDOR, Duration::from_secs(1)).unwrap();
+        let (mut transport, status) =
+            start(StalePad::default(), PDP_VENDOR, Duration::from_secs(1)).unwrap();
+        assert_eq!(status, StartupStatus::Announced);
         let report = transport
             .read(Duration::from_millis(10))
             .unwrap()
-            .expect("an opened stale pad must deliver input after reset and startup");
+            .expect("an announced pad must deliver input after startup");
         let mut pad = Pad::default();
         assert!(pad.apply_input(&report));
         assert_eq!(pad.pressed(), ["A", "Up"]);
@@ -274,7 +255,7 @@ mod tests {
         assert_eq!((pad.left_stick, pad.right_stick), ((1, 2), (3, 4)));
         assert_eq!(
             transport.trace,
-            ["reset", "announce", "start", "led", "authenticate"]
+            ["announce", "start", "led", "authenticate"]
         );
     }
 
@@ -285,16 +266,17 @@ mod tests {
             ..StalePad::default()
         };
         let timeout = Duration::from_millis(10);
-        let mut transport = start(fake, PDP_VENDOR, timeout).unwrap();
-        assert_eq!(transport.trace, ["reset", "start", "led", "authenticate"]);
+        let (mut transport, status) = start(fake, PDP_VENDOR, timeout).unwrap();
+        assert_eq!(status, StartupStatus::TimedOut);
+        assert_eq!(transport.trace, ["start", "led", "authenticate"]);
         assert!(transport.timeouts.iter().all(|t| *t <= timeout));
         assert!(transport.read(timeout).unwrap().is_some());
     }
 
     #[test]
     fn non_pdp_gets_only_start_after_announce() {
-        let transport = start(StalePad::default(), 0x1234, Duration::from_secs(1)).unwrap();
-        assert_eq!(transport.trace, ["reset", "announce", "start"]);
+        let (transport, _) = start(StalePad::default(), 0x1234, Duration::from_secs(1)).unwrap();
+        assert_eq!(transport.trace, ["announce", "start"]);
     }
 
     #[test]
@@ -319,11 +301,12 @@ mod tests {
             ..StalePad::default()
         };
         let mut seen = Vec::new();
-        let transport =
-            reset_and_wait(fake, Duration::from_secs(1), |p| seen.push(p.to_vec())).unwrap();
+        let (transport, status) =
+            wait(fake, Duration::from_secs(1), |p| seen.push(p.to_vec())).unwrap();
+        assert_eq!(status, StartupStatus::Announced);
         assert_eq!(&seen[..invalid.len()], invalid);
         assert_eq!(seen.last(), Some(&hello()));
-        assert_eq!(transport.trace, ["reset", "announce"]);
+        assert_eq!(transport.trace, ["announce"]);
         assert!(
             !transport.started,
             "the caller chooses START or metadata request"
@@ -337,9 +320,10 @@ mod tests {
             continuous_traffic: true,
             ..StalePad::default()
         };
-        let transport = start(fake, 0x1234, Duration::from_millis(10)).unwrap();
+        let (transport, status) = start(fake, 0x1234, Duration::from_millis(10)).unwrap();
+        assert_eq!(status, StartupStatus::TimedOut);
         assert!(!transport.timeouts.is_empty());
-        assert_eq!(transport.trace, ["reset", "start"]);
+        assert_eq!(transport.trace, ["start"]);
     }
 
     #[test]
@@ -352,7 +336,7 @@ mod tests {
                 packets: [invalid].into(),
                 ..StalePad::default()
             };
-            let transport = reset_and_wait(fake, Duration::from_secs(1), |_| {}).unwrap();
+            let (transport, _) = wait(fake, Duration::from_secs(1), |_| {}).unwrap();
             assert_eq!(
                 transport.timeouts.len(),
                 2,
@@ -376,7 +360,7 @@ mod tests {
             packets: [packet].into(),
             ..StalePad::default()
         };
-        let transport = reset_and_wait(fake, Duration::from_secs(1), |_| {}).unwrap();
+        let (transport, _) = wait(fake, Duration::from_secs(1), |_| {}).unwrap();
         assert_eq!(
             transport.timeouts.len(),
             1,
@@ -404,18 +388,11 @@ mod tests {
     }
 
     #[test]
-    fn reset_and_read_errors_are_not_misreported_as_announce_timeouts() {
-        for fake in [
-            StalePad {
-                reset_error: true,
-                ..StalePad::default()
-            },
-            StalePad {
-                read_error: true,
-                ..StalePad::default()
-            },
-        ] {
-            assert!(start(fake, PDP_VENDOR, Duration::from_millis(10)).is_err());
-        }
+    fn read_errors_are_not_misreported_as_announce_timeouts() {
+        let fake = StalePad {
+            read_error: true,
+            ..StalePad::default()
+        };
+        assert!(wait(fake, Duration::from_millis(10), |_| {}).is_err());
     }
 }

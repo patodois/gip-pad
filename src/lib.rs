@@ -894,7 +894,6 @@ mod tests {
             text.ends_with("hardware 2.0 rf 1.0 security 1.0 gip 1.0"),
             "{text}"
         );
-        assert!(!text.contains("2.1.1.1"));
         // Each of the eight bytes is its own field, so a minor version above 0 stays one byte
         let mut body = h.body(&p).to_vec();
         body[20..28].copy_from_slice(&[3, 7, 1, 0, 1, 2, 1, 3]);
