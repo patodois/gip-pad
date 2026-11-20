@@ -21,9 +21,10 @@ only lets you build and sign with a paid developer account. See
 system_profiler SPUSBHostDataType
 ```
 
-Look for your pad, then build and run `gip-pad --info` (below). It applies if the pad has an
-interface with class `ff`, subclass `47`, protocol `d0`, which is GIP. Product names are not a
-reliable guide: one name can cover several USB IDs and firmware versions.
+Look for your pad and its interfaces. It applies if the pad has an interface with class `ff`,
+subclass `47`, protocol `d0`, which is GIP. Product names are not a reliable guide: one name can cover
+several USB IDs and firmware versions. `gip-pad --info` (below) prints the full descriptors too, but
+it also resets the pad and sends it packets; add `--no-reset` to skip the reset.
 
 ## Example: PDP Afterglow Wave Wired Controller for Xbox
 
@@ -58,7 +59,8 @@ ninja -C SDL/build SDL3-shared
 `SDL_HIDAPI_LIBUSB_SHARED=OFF` links libusb directly. SDL otherwise loads it at run time and does not
 find Homebrew's copy unless `DYLD_FALLBACK_LIBRARY_PATH=/opt/homebrew/lib` is set.
 
-Check that SDL sees the pad with `tools/sdl_padcheck.c`:
+Check that SDL sees the pad with `tools/sdl_padcheck.c`, which is in this repository (not in the
+crates.io package):
 
 ```sh
 cc -O2 tools/sdl_padcheck.c -I SDL/include -L SDL/build -lSDL3 -Wl,-rpath,"$PWD/SDL/build" -o sdl_padcheck
@@ -73,14 +75,24 @@ Share (`misc1`) and Guide.
 
 ```sh
 cargo build --release
-./target/release/gip-pad            # live line: sticks, triggers, pressed buttons
-./target/release/gip-pad --raw      # every packet in hex
-./target/release/gip-pad --info     # USB descriptors, firmware, hardware and protocol versions, metadata
+./target/release/gip-pad              # live line: sticks, triggers, pressed buttons
+./target/release/gip-pad --raw        # every packet in hex
+./target/release/gip-pad --seconds 30 # stop after 30 seconds instead of at Ctrl+C
+./target/release/gip-pad --info       # USB descriptors, firmware, hardware and protocol versions, metadata
+./target/release/gip-pad --no-reset   # open without a USB reset, as 0.2.3 did (also with --info)
+./target/release/gip-pad --help       # usage; touches no device
 ```
+
+Every mode except `--help` opens the first GIP pad it finds and sends it packets: unless
+`--no-reset` is given, it first resets the pad over USB. Reading also starts the pad and rumbles it
+briefly. Unknown arguments are refused.
+
+The library is Rust only: there is no C ABI and no C# binding.
 
 `Controller::open()` and `--info` reset USB and reopen the same bus/port/VID/PID, allowing
 up to three seconds for re-enumeration, then up to 1500 ms for announce. If reset is unsupported,
-opening continues without reset. If announce times out, the existing packets are still sent.
+or refused because another program holds the device open exclusively, opening continues without
+reset, as in 0.2.3. If announce times out, the existing packets are still sent.
 `--info` responds with Metadata Request; `Controller::open()` responds with START and, for PDP
 pads (vendor 0x0e6f), the existing LED and security packets.
 
@@ -90,12 +102,14 @@ Use `Controller::open_without_reset()` or `PadReader::spawn_without_reset()` for
 opening behavior, without reset or an announce wait, including after replug in the reader.
 This behavior change is released as **0.3.0**.
 
-`PadReader::spawn()` performs at most one reset per physical connection. A reset refused before
-it takes place leaves that reset available for the next attempt. After a performed reset, failed
+`PadReader::spawn()` performs at most one reset per physical connection. A refused reset opens the
+pad without one and leaves the reset available for the next attempt, after that session ends. After a performed reset, failed
 reopening retries without another reset. Retry delays are 1, 2, 4 and then at most 8 seconds;
 a successful opening clears the backoff even when no input report has arrived. USB re-enumeration
 caused by its own reset is kept in the same connection; a later physical reconnect allows a
 new reset. Silence alone does not cause a reset, because unchanged input need not be sent.
+If the pad announces itself again during a session, it has restarted: the start packets are sent
+again, and the state reads as all released until the pad reports input.
 If the device has not reappeared after reset, the reader conservatively treats its next
 appearance as that pending reset until it can identify the replacement USB instance.
 Reset reopening filters bus, port, VID and PID before descriptor inspection, so it only opens
@@ -147,6 +161,10 @@ inspection. On other platforms no owner is ever reported.
 
 ### 0.3.0
 
+- Reset the pad and wait for its announce before starting input, recovering pads left in an old
+  state after sleep or an earlier program. The library and `--info` share the reset, reopen and
+  announce path. Silence does not cause a reset: MS-GIPUSB section 3.1.5.6.1.1 recommends sending
+  input only when a field changes.
 - Add `Controller::open_without_reset()`, `PadReader::spawn_without_reset()`, `announced()` and
   `startup_status()`. Keep startup
   diagnostics in the CLI, and continue with the legacy sequence when USB reset is unsupported.
@@ -163,18 +181,11 @@ inspection. On other platforms no owner is ever reported.
   add reproducible mutation checks for reset, port/VID/PID filtering, the reopen window and metadata.
 - Package only crate sources, README, manifests and licenses.
 
-### 0.2.4
-
-- Reset and wait for announce on every controller open, recovering pads left in an old state after
-  sleep or an earlier program. The library and `--info` share the reset/reopen/announce path.
-- Keep startup working when announce times out; log the reason and send the existing start packets.
-- Do not reset an already opened pad merely because input is quiet: MS-GIPUSB section 3.1.5.6.1.1
-  recommends sending input only when a field changes. `PadReader` uses the reset on each open.
-- Add hardware-free transport tests for stale pads, announce timeout, malformed packets and errors.
-
 ## How it works
 
-`src/main.rs` documents what is sent and received.
+The module documentation at the top of `src/lib.rs`, with `src/startup.rs` and
+`src/connection.rs`, describes what is sent and received and cites the MS-GIPUSB sections where
+they are used. `AGENTS.md` maps the code.
 
 ### Provenance
 
