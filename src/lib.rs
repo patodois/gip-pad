@@ -643,6 +643,10 @@ impl Controller {
 
     /// Waits up to `timeout` for one packet, acknowledges it if asked, and updates the state.
     /// Returns the raw packet, or `None` on a timeout.
+    ///
+    /// A valid Hello Device in the middle of a session means the pad started again and waits for
+    /// the host (MS-GIPUSB 3.1.5.5.1): the start packets are sent again, and the state goes back to
+    /// all released until the pad reports input.
     pub fn poll(&mut self, timeout: Duration) -> Result<Option<Vec<u8>>> {
         let Some(p) = self
             .gip
@@ -658,6 +662,12 @@ impl Controller {
                 {
                     self.gip.ack(&h, h.length as u16, 0)?;
                 }
+            }
+            if Header::parse(&p).is_some_and(|h| h.is_announce(&p)) {
+                self.pad = Pad::default();
+                startup::send_start(&mut self.gip, self.vendor)
+                    .context("restarting the controller after it announced again")?;
+                return Ok(Some(p));
             }
             match p[0] {
                 CMD_INPUT => {

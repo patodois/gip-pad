@@ -69,6 +69,10 @@ MUTANTS = [
     ("M25 a refused reset waits for Hello instead of opening as 0.2.3 did", "src/connection.rs",
      "ResetResult::Refused => Some(StartupStatus::ResetRefused),",
      "ResetResult::Refused => None,"),
+    ("M26 a Hello during polling does not restart the pad", "src/lib.rs",
+     "startup::send_start(&mut self.gip, self.vendor)\n                    .context(", "Ok::<(), anyhow::Error>(())\n                    .context("),
+    ("M27 a Hello during polling keeps the last state", "src/lib.rs",
+     "self.pad = Pad::default();\n", ""),
 ]
 
 

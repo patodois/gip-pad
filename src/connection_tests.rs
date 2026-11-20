@@ -896,11 +896,63 @@ fn polling_only_acknowledges_hello_with_a_valid_device_id() {
     }
     let writes = writes.lock().unwrap();
     assert_eq!(
-        writes.len(),
-        1,
-        "invalid Hello IDs must not receive ACKs during input polling"
+        writes.iter().map(|p| p[0]).collect::<Vec<_>>(),
+        [crate::CMD_ACK, CMD_POWER, CMD_LED, CMD_AUTHENTICATE],
+        "invalid Hello IDs must not receive ACKs during input polling; the valid one restarts the pad"
     );
-    assert_eq!(writes[0][0], crate::CMD_ACK);
+}
+
+#[test]
+fn a_hello_during_polling_restarts_the_pad_and_releases_every_input() {
+    install(State::default());
+    let mut controller = Controller::open().unwrap();
+    let mut held = vec![CMD_INPUT, 0, 2, 14];
+    held.extend(16u16.to_le_bytes());
+    held.extend([0, 2, 255, 3, 1, 0, 2, 0, 3, 0, 4, 0]);
+    let writes = Arc::new(Mutex::new(Vec::new()));
+    controller.gip.io = Box::new(QueuedIo {
+        packets: [held, hello()].into(),
+        writes: writes.clone(),
+    });
+    controller.poll(Duration::ZERO).unwrap().unwrap();
+    assert_eq!(controller.state().pressed(), ["A"]);
+    controller.poll(Duration::ZERO).unwrap().unwrap();
+    assert_eq!(
+        controller.state(),
+        Pad::default(),
+        "a pad that announces again has restarted: nothing is held until it reports"
+    );
+    assert_eq!(
+        writes
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|p| p[0])
+            .collect::<Vec<_>>(),
+        [CMD_POWER, CMD_LED, CMD_AUTHENTICATE]
+    );
+}
+
+#[test]
+fn pad_reader_restarts_a_pad_that_announces_again_without_reconnecting() {
+    let state = install(State::default());
+    let reader = PadReader::spawn();
+    wait_until(|| reader.latest().is_some_and(|p| p.buttons == 16));
+    {
+        // The pad restarts without leaving the bus: it announces again and waits for START.
+        let mut state = state.lock().unwrap();
+        state.hello_sent = false;
+        state.power = false;
+        state.led = false;
+        state.auth = false;
+        state.input_sent = false;
+        state.buttons = 32;
+    }
+    wait_until(|| reader.latest().is_some_and(|p| p.buttons == 32));
+    drop(reader);
+    let state = state.lock().unwrap();
+    assert_eq!(state.resets, 1);
+    assert_eq!(state.opens.len(), 1, "the session was kept");
 }
 
 #[test]
