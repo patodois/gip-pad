@@ -13,6 +13,7 @@ struct State {
     writes: Vec<Vec<u8>>,
     stale: bool,
     unsupported: bool,
+    refuse_reset: bool,
     emit_announce: bool,
     hello_sent: bool,
     input_sent: bool,
@@ -55,6 +56,7 @@ impl Default for State {
             writes: Vec::new(),
             stale: true,
             unsupported: false,
+            refuse_reset: false,
             emit_announce: true,
             hello_sent: false,
             input_sent: false,
@@ -121,6 +123,9 @@ impl Backend for FakeBackend {
         state.resets += 1;
         if state.unsupported {
             return Ok(ResetResult::Unsupported);
+        }
+        if state.refuse_reset {
+            return Ok(ResetResult::Refused);
         }
         state.candidate.instance = format!("reset-{}", state.resets);
         state.ready_at = state.now + state.ready_delay;
@@ -333,13 +338,55 @@ fn unsupported_reset_uses_legacy_startup_without_an_announce_wait() {
     assert_input(&mut controller);
     assert_eq!(state.lock().unwrap().now, Duration::ZERO);
     assert_eq!(
-        reset_result(nusb::ErrorKind::Unsupported),
+        reset_result(nusb::ErrorKind::Unsupported, None),
         Some(ResetResult::Unsupported)
     );
     for kind in [nusb::ErrorKind::NotFound, nusb::ErrorKind::Disconnected] {
-        assert_eq!(reset_result(kind), Some(ResetResult::Reset));
+        assert_eq!(reset_result(kind, None), Some(ResetResult::Reset));
     }
-    assert_eq!(reset_result(nusb::ErrorKind::PermissionDenied), None);
+    assert_eq!(reset_result(nusb::ErrorKind::PermissionDenied, None), None);
+}
+
+#[test]
+fn refused_reset_opens_as_0_2_3_did() {
+    // Another program holds the device (not the interface) exclusively, so macOS refuses the
+    // reset; the pad itself was never stale and can still be claimed.
+    let state = install(State {
+        refuse_reset: true,
+        stale: false,
+        emit_announce: false,
+        ..State::default()
+    });
+    let mut controller = Controller::open().unwrap();
+    assert_eq!(controller.startup_status(), StartupStatus::ResetRefused);
+    assert!(!controller.announced());
+    assert_input(&mut controller);
+    let state = state.lock().unwrap();
+    assert_eq!(state.resets, 1);
+    assert_eq!(
+        state.now,
+        Duration::ZERO,
+        "no announce wait without a reset"
+    );
+    assert_eq!(
+        state.writes.iter().map(|p| p[0]).collect::<Vec<_>>(),
+        [CMD_POWER, CMD_LED, CMD_AUTHENTICATE]
+    );
+}
+
+#[test]
+fn exclusive_access_errors_mean_the_reset_was_refused() {
+    use crate::owner::IO_RETURN_EXCLUSIVE_ACCESS;
+    assert_eq!(
+        reset_result(nusb::ErrorKind::Busy, None),
+        Some(ResetResult::Refused)
+    );
+    assert_eq!(
+        reset_result(nusb::ErrorKind::Other, Some(IO_RETURN_EXCLUSIVE_ACCESS)),
+        Some(ResetResult::Refused)
+    );
+    assert_eq!(reset_result(nusb::ErrorKind::Other, None), None);
+    assert_eq!(reset_result(nusb::ErrorKind::PermissionDenied, None), None);
 }
 
 #[test]
@@ -436,12 +483,14 @@ fn pad_reader_resets_after_reconnection_even_if_the_os_reuses_its_id() {
     drop(reader);
 }
 
-/// A stale pad that only sends input after a real USB reset. Its first reset attempt is refused
-/// (another program still holds it, as kIOReturnExclusiveAccess would be), then the other
-/// program exits and the pad is free but still stale.
+/// A pad behind a device that another program holds exclusively: macOS refuses the USB reset
+/// (kIOReturnExclusiveAccess) while the GIP interface can still be claimed. `needs_reset` makes it
+/// a stale pad that sends input only after a performed reset.
 struct Refusing {
     now: Duration,
     refusals_left: usize,
+    needs_reset: bool,
+    fail_read_at: Option<Duration>,
     resets: usize,
     refused: usize,
     opens: usize,
@@ -450,6 +499,25 @@ struct Refusing {
     hello_sent: bool,
     started: bool,
     input_sent: bool,
+}
+
+impl Refusing {
+    fn new(refusals_left: usize, needs_reset: bool) -> Arc<Mutex<Self>> {
+        Arc::new(Mutex::new(Self {
+            now: Duration::ZERO,
+            refusals_left,
+            needs_reset,
+            fail_read_at: None,
+            resets: 0,
+            refused: 0,
+            opens: 0,
+            instance: "physical-1".into(),
+            reset_done: false,
+            hello_sent: false,
+            started: false,
+            input_sent: false,
+        }))
+    }
 }
 
 struct RefusingBackend(Arc<Mutex<Refusing>>);
@@ -472,11 +540,13 @@ impl Backend for RefusingBackend {
         if s.refusals_left > 0 {
             s.refusals_left -= 1;
             s.refused += 1;
-            anyhow::bail!("resetting the controller (held by pid 42, OtherApp)");
+            return Ok(ResetResult::Refused);
         }
         s.resets += 1;
         s.reset_done = true;
         s.hello_sent = false;
+        s.started = false;
+        s.input_sent = false;
         s.instance = format!("after-reset-{}", s.resets);
         Ok(ResetResult::Reset)
     }
@@ -498,11 +568,15 @@ impl Backend for RefusingBackend {
 impl PacketIo for RefusingIo {
     fn read(&mut self, timeout: Duration) -> Result<Option<Vec<u8>>> {
         let mut s = self.0.lock().unwrap();
+        if s.fail_read_at.is_some_and(|at| s.now >= at) {
+            s.fail_read_at = None;
+            anyhow::bail!("fake read failed");
+        }
         if s.reset_done && !s.hello_sent {
             s.hello_sent = true;
             return Ok(Some(hello()));
         }
-        if s.reset_done && s.started && !s.input_sent {
+        if (s.reset_done || !s.needs_reset) && s.started && !s.input_sent {
             s.input_sent = true;
             let mut report = vec![CMD_INPUT, 0, 1, 14, 16, 0];
             report.extend([0; 12]);
@@ -521,22 +595,34 @@ impl PacketIo for RefusingIo {
     }
 }
 
-#[test]
-fn pad_reader_retries_a_refused_reset_before_opening_a_stale_pad() {
-    let state = Arc::new(Mutex::new(Refusing {
-        now: Duration::ZERO,
-        refusals_left: 1,
-        resets: 0,
-        refused: 0,
-        opens: 0,
-        instance: "physical-1".into(),
-        reset_done: false,
-        hello_sent: false,
-        started: false,
-        input_sent: false,
-    }));
+fn spawn_refusing(state: &Arc<Mutex<Refusing>>) -> PadReader {
     TEST_BACKEND.with(|slot| *slot.borrow_mut() = Some(Box::new(RefusingBackend(state.clone()))));
-    let reader = PadReader::spawn();
+    PadReader::spawn()
+}
+
+#[test]
+fn pad_reader_opens_without_reset_when_every_reset_is_refused() {
+    let state = Refusing::new(usize::MAX, false);
+    let reader = spawn_refusing(&state);
+    wait_until(|| state.lock().unwrap().now >= Duration::from_secs(60));
+    let latest = reader.latest();
+    let error = reader.last_error();
+    drop(reader);
+    let state = state.lock().unwrap();
+    assert!(state.refused >= 1);
+    assert_eq!(state.resets, 0);
+    assert_eq!(state.opens, 1, "the opened pad is kept, not reopened");
+    assert_eq!(latest.map(|p| p.buttons), Some(16));
+    assert_eq!(error, None);
+}
+
+#[test]
+fn pad_reader_keeps_the_reset_available_after_a_refusal() {
+    // A stale pad: the refused reset still opens it, but it stays silent. When that session
+    // ends, the next attempt may reset, because the refusal did not use the physical reset.
+    let state = Refusing::new(1, true);
+    state.lock().unwrap().fail_read_at = Some(Duration::from_secs(20));
+    let reader = spawn_refusing(&state);
     wait_until(|| state.lock().unwrap().now >= Duration::from_secs(60));
     let buttons = reader.latest().map(|p| p.buttons);
     drop(reader);
@@ -546,7 +632,7 @@ fn pad_reader_retries_a_refused_reset_before_opening_a_stale_pad() {
         state.resets, 1,
         "a refusal must leave the physical reset available"
     );
-    assert!(state.opens >= 1);
+    assert!(state.opens >= 2);
     assert_eq!(buttons, Some(16), "input requires a performed reset");
 }
 

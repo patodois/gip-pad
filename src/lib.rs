@@ -587,7 +587,9 @@ pub struct Controller {
 
 impl Controller {
     /// Opens with one USB reset, up to 3 s of reopen attempts and a 1500 ms Hello wait.
-    /// An absent Hello or unsupported reset does not prevent the existing startup sequence.
+    /// An absent Hello does not prevent the existing startup sequence. If the reset is unsupported,
+    /// or refused because the device is open exclusively elsewhere, the pad is opened as in 0.2.3
+    /// ([`StartupStatus::ResetUnsupported`], [`StartupStatus::ResetRefused`]).
     pub fn open() -> Result<Self> {
         connection::with_backend(|backend| Self::open_from(backend, true))
     }
@@ -690,7 +692,8 @@ pub fn trigger(v: u16) -> f32 {
 }
 
 /// Reads a controller on its own thread. Retries use exponential backoff capped at 8 s;
-/// each physical connection is reset at most once, even if reopening fails.
+/// each physical connection is reset at most once, even if reopening fails. A refused reset
+/// opens the pad without one and leaves the reset available for the next attempt.
 /// Silence does not trigger reset (MS-GIPUSB 3.1.5.6.1.1: send input only on changes).
 /// Dropping during startup can wait several seconds for USB operations to finish.
 pub struct PadReader {

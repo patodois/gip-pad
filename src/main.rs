@@ -29,6 +29,8 @@ trait InfoSource {
 struct UsbInfo {
     session: Option<(Found, nusb::Device)>,
     origin: std::time::Instant,
+    /// Reset the pad so it announces itself again; `--no-reset` opens it as 0.2.3 did.
+    reset: bool,
 }
 
 impl InfoSource for UsbInfo {
@@ -112,7 +114,11 @@ impl InfoSource for UsbInfo {
     }
     fn reopen(&mut self, on_packet: &mut dyn FnMut(&[u8])) -> Result<(Gip, StartupStatus)> {
         let (found, device) = self.session.take().context("missing diagnostic device")?;
-        found.reset_and_wait(device, on_packet)
+        if self.reset {
+            return found.reset_and_wait(device, on_packet);
+        }
+        drop(device);
+        found.open().map(|(_, gip)| (gip, StartupStatus::Skipped))
     }
     fn now(&self) -> Duration {
         self.origin.elapsed()
@@ -127,6 +133,9 @@ fn startup_warning(status: StartupStatus) -> Option<&'static str> {
         StartupStatus::ResetUnsupported => {
             Some("gip-pad: USB reset unsupported; continuing without reset")
         }
+        StartupStatus::ResetRefused => Some(
+            "gip-pad: USB reset refused (the device is open exclusively elsewhere); continuing without reset",
+        ),
         _ => None,
     }
 }
@@ -226,10 +235,12 @@ fn info(
 
 fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    let reset = !args.iter().any(|a| a == "--no-reset");
     if args.iter().any(|a| a == "--info") {
         let mut source = UsbInfo {
             session: None,
             origin: std::time::Instant::now(),
+            reset,
         };
         return info(
             &mut source,
@@ -244,7 +255,11 @@ fn main() -> Result<()> {
         .position(|a| a == "--seconds")
         .and_then(|i| args.get(i + 1)?.parse().ok());
 
-    let mut c = Controller::open()?;
+    let mut c = if reset {
+        Controller::open()?
+    } else {
+        Controller::open_without_reset()?
+    };
     if let Some(warning) = startup_warning(c.startup_status()) {
         eprintln!("{warning}");
     }

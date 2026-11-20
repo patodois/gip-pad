@@ -140,6 +140,8 @@ pub(crate) trait Clock {
 pub(crate) enum ResetResult {
     Reset,
     Unsupported,
+    /// The device is open exclusively elsewhere, so no reset took place.
+    Refused,
 }
 
 pub(crate) trait Backend: Clock + Send {
@@ -178,11 +180,13 @@ impl Clock for UsbBackend {
     }
 }
 
-/// A reset can invalidate its own handle; Unsupported preserves the old opening path.
-fn reset_result(kind: nusb::ErrorKind) -> Option<ResetResult> {
+/// A reset can invalidate its own handle; Unsupported preserves the old opening path, and so does
+/// a reset refused because the device is open exclusively elsewhere (nothing was reset then).
+fn reset_result(kind: nusb::ErrorKind, os_error: Option<u32>) -> Option<ResetResult> {
     match kind {
         nusb::ErrorKind::NotFound | nusb::ErrorKind::Disconnected => Some(ResetResult::Reset),
         nusb::ErrorKind::Unsupported => Some(ResetResult::Unsupported),
+        _ if crate::owner::is_exclusive_access(kind, os_error) => Some(ResetResult::Refused),
         _ => None,
     }
 }
@@ -223,7 +227,7 @@ impl Backend for UsbBackend {
         };
         match device.reset().wait() {
             Ok(()) => Ok(ResetResult::Reset),
-            Err(e) => match reset_result(e.kind()) {
+            Err(e) => match reset_result(e.kind(), e.os_error()) {
                 Some(result) => Ok(result),
                 None => Err(found.explain_error(e, "resetting the controller".into())),
             },
@@ -265,12 +269,14 @@ pub(crate) fn reset_and_wait(
 ) -> Result<(Gip, StartupStatus, String)> {
     // MS-GIPUSB 3.1.1: USB Reset is handled from all GIP states.
     let reset_result = backend.reset(candidate)?;
-    if reset_result == ResetResult::Unsupported {
-        return Ok((
-            backend.open(candidate)?,
-            StartupStatus::ResetUnsupported,
-            candidate.instance.clone(),
-        ));
+    // Without a reset there is no Hello to wait for: open as 0.2.3 did.
+    let not_reset = match reset_result {
+        ResetResult::Reset => None,
+        ResetResult::Unsupported => Some(StartupStatus::ResetUnsupported),
+        ResetResult::Refused => Some(StartupStatus::ResetRefused),
+    };
+    if let Some(status) = not_reset {
+        return Ok((backend.open(candidate)?, status, candidate.instance.clone()));
     }
     *performed = true;
     let until = backend.now() + Duration::from_secs(3);
@@ -364,7 +370,8 @@ pub(crate) fn read_loop(
             let mut performed = false;
             let result = Controller::open_candidate(backend, &found, reset, &mut performed);
             if reset && !performed {
-                // A refused or unsupported reset did not change this physical connection.
+                // A refused or unsupported reset did not change this physical connection, so the
+                // next attempt (after this session ends) may try the reset again.
                 attempts
                     .connections
                     .retain(|(port, _, _)| !same_port(port, &found.port));

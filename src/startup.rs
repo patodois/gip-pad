@@ -12,9 +12,16 @@ pub(crate) const ANNOUNCE_TIMEOUT: Duration = Duration::from_millis(1500);
 /// Outcome of the optional reset and Hello Device handshake.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum StartupStatus {
+    /// The pad was reset and sent a valid Hello Device.
     Announced,
+    /// The pad was reset but sent no valid Hello Device in time; startup continued.
     TimedOut,
+    /// The platform cannot reset the device; it was opened as in 0.2.3.
     ResetUnsupported,
+    /// The reset was refused because the device is open exclusively elsewhere; it was opened as
+    /// in 0.2.3.
+    ResetRefused,
+    /// No reset was asked for (`open_without_reset`, `spawn_without_reset`).
     Skipped,
 }
 

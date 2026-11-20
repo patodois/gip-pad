@@ -64,11 +64,16 @@ MUTANTS = [
      ".filter(|h| h.command != 0x02 || h.is_announce(&p))", ""),
     ("M23 metadata acknowledges invalid Hello IDs", "src/main.rs",
      "&& (h.command != 0x02 || h.is_announce(&p))", ""),
+    ("M24 a reset refused for exclusive access becomes fatal", "src/connection.rs",
+     "_ if crate::owner::is_exclusive_access(kind, os_error) => Some(ResetResult::Refused),", ""),
+    ("M25 a refused reset waits for Hello instead of opening as 0.2.3 did", "src/connection.rs",
+     "ResetResult::Refused => Some(StartupStatus::ResetRefused),",
+     "ResetResult::Refused => None,"),
 ]
 
 
 FOCUSED_TESTS = {
-    "M15": "pad_reader_retries_a_refused_reset_before_opening_a_stale_pad",
+    "M15": "pad_reader_keeps_the_reset_available_after_a_refusal",
     "M16": "successful_open_resets_backoff_even_without_an_input_packet",
     "M17": "dropping_reader_interrupts_the_eight_second_retry_wait",
     "M22": "polling_only_acknowledges_hello_with_a_valid_device_id",
