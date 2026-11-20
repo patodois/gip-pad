@@ -673,27 +673,31 @@ impl Controller {
         else {
             return Ok(None);
         };
-        if p.len() >= 4 {
-            if p[1] & OPT_ACK_WANTED != 0 {
-                if let Some(h) =
-                    Header::parse(&p).filter(|h| h.command != 0x02 || h.is_announce(&p))
-                {
-                    self.gip.ack(&h, ack_count(h.length)?, 0)?;
+        let Some(h) = Header::parse(&p) else {
+            return Ok(Some(p));
+        };
+        let announce = h.is_announce(&p);
+        // A Hello with an invalid Device ID is not answered (MS-GIPUSB 3.1.5.5.1).
+        if h.options & OPT_ACK_WANTED != 0 && (h.command != 0x02 || announce) {
+            self.gip.ack(&h, ack_count(h.length)?, 0)?;
+        }
+        if announce {
+            self.pad = Pad::default();
+            startup::send_start(&mut self.gip, self.vendor)
+                .context("restarting the controller after it announced again")?;
+            return Ok(Some(p));
+        }
+        match h.command {
+            CMD_INPUT => {
+                self.pad.apply_input(&p);
+            }
+            // Bit 0 of the first payload byte; see the README on where this comes from
+            CMD_GUIDE if h.chunk.is_none() => {
+                if let Some(state) = h.body(&p).first() {
+                    self.pad.guide = state & 1 != 0;
                 }
             }
-            if Header::parse(&p).is_some_and(|h| h.is_announce(&p)) {
-                self.pad = Pad::default();
-                startup::send_start(&mut self.gip, self.vendor)
-                    .context("restarting the controller after it announced again")?;
-                return Ok(Some(p));
-            }
-            match p[0] {
-                CMD_INPUT => {
-                    self.pad.apply_input(&p);
-                }
-                CMD_GUIDE if p.len() > 4 => self.pad.guide = p[4] & 1 != 0,
-                _ => {}
-            }
+            _ => {}
         }
         Ok(Some(p))
     }

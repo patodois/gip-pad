@@ -61,7 +61,7 @@ MUTANTS = [
     ("M21 later GIP errors overwrite the first device error", "src/connection.rs",
      "gip_error.get_or_insert(error);", "gip_error = Some(error);"),
     ("M22 input polling acknowledges invalid Hello IDs", "src/lib.rs",
-     ".filter(|h| h.command != 0x02 || h.is_announce(&p))", ""),
+     "&& (h.command != 0x02 || announce)", ""),
     ("M23 metadata acknowledges invalid Hello IDs", "src/main.rs",
      "&& (h.command != 0x02 || h.is_announce(&p))", ""),
     ("M24 a reset refused for exclusive access becomes fatal", "src/connection.rs",
@@ -70,7 +70,7 @@ MUTANTS = [
      "ResetResult::Refused => Some(StartupStatus::ResetRefused),",
      "ResetResult::Refused => None,"),
     ("M26 a Hello during polling does not restart the pad", "src/lib.rs",
-     "startup::send_start(&mut self.gip, self.vendor)\n                    .context(", "Ok::<(), anyhow::Error>(())\n                    .context("),
+     "startup::send_start(&mut self.gip, self.vendor)\n                .context(", "Ok::<(), anyhow::Error>(())\n                .context("),
     ("M27 a Hello during polling keeps the last state", "src/lib.rs",
      "self.pad = Pad::default();\n", ""),
     ("M28 send accepts a length byte with bit 7 set", "src/lib.rs",
@@ -80,6 +80,8 @@ MUTANTS = [
      ".filter(|&n| n <= 0x7F && 4 + usize::from(n) <= max)", ".filter(|&n| n <= 0x7F)"),
     ("M30 acknowledgement counts are truncated", "src/lib.rs",
      "u16::try_from(n).with_context(", "Ok::<u16, anyhow::Error>(n as u16).with_context("),
+    ("M31 Guide is read from a fragment", "src/lib.rs",
+     "CMD_GUIDE if h.chunk.is_none() => {", "CMD_GUIDE => {"),
 ]
 
 

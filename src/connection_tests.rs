@@ -934,6 +934,40 @@ fn polling_refuses_to_acknowledge_a_length_the_ack_cannot_hold() {
 }
 
 #[test]
+fn guide_is_read_from_the_parsed_payload() {
+    install(State::default());
+    let mut controller = Controller::open().unwrap();
+    let writes = Arc::new(Mutex::new(Vec::new()));
+    controller.gip.io = Box::new(QueuedIo {
+        packets: [
+            // Pressed, with a two-byte varint length (0x82 0x00 = 2)
+            vec![crate::CMD_GUIDE, OPT_INTERNAL, 1, 0x82, 0x00, 0x01, 0x5B],
+            // Length 0 with a trailing byte: no payload, so no change
+            vec![crate::CMD_GUIDE, OPT_INTERNAL, 2, 0x00, 0x00],
+            // A fragment carries no Guide state
+            vec![
+                crate::CMD_GUIDE,
+                OPT_INTERNAL | crate::OPT_CHUNK,
+                3,
+                0x01,
+                0x00,
+                0x00,
+            ],
+            // Released
+            vec![crate::CMD_GUIDE, OPT_INTERNAL, 4, 0x02, 0x00, 0x5B],
+        ]
+        .into(),
+        writes,
+    });
+    let mut guide = Vec::new();
+    for _ in 0..4 {
+        controller.poll(Duration::ZERO).unwrap().unwrap();
+        guide.push(controller.state().guide);
+    }
+    assert_eq!(guide, [true, true, true, false]);
+}
+
+#[test]
 fn a_hello_during_polling_restarts_the_pad_and_releases_every_input() {
     install(State::default());
     let mut controller = Controller::open().unwrap();
