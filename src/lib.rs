@@ -424,87 +424,53 @@ fn scan(include_system: bool) -> Result<Detected> {
     )
 }
 
-fn inspect_devices(
-    include_system: bool,
-    devices: impl IntoIterator<Item = DeviceInfo>,
-) -> Result<Detected> {
+/// What inspecting one listed USB device found.
+enum Inspected<D> {
+    /// Not a GIP pad.
+    Skip,
+    /// A GIP pad that can be used.
+    Pad(D),
+    /// A GIP pad a macOS driver holds, and the pad itself if it may be returned for inspection.
+    Held(SystemOwned, Option<D>),
+    /// A device that might have been a pad, but whose descriptors could not be read.
+    Unreadable(String),
+    /// A listed GIP pad that could not be opened.
+    Failed(anyhow::Error),
+}
+
+/// The first usable pad. Devices after it are not inspected (the iterator is lazy); a pad that
+/// cannot be opened does not hide a usable one later in the list, and its error is returned only
+/// if none is found.
+fn first_pad<D>(results: impl IntoIterator<Item = Inspected<D>>) -> Result<D> {
     let mut unreadable: Vec<String> = Vec::new();
     // Pads a system driver holds; the first one decides the error if nothing else turns up
-    let mut held: Vec<SystemOwned> = Vec::new();
-    let mut held_found: Option<Detected> = None;
-    for info in devices {
-        let listed: Vec<(u8, u8, u8)> = info
-            .interfaces()
-            .map(|i| (i.class(), i.subclass(), i.protocol()))
-            .collect();
-        let listed_gip = listed.contains(&GIP_CLASS);
-        if !listed_gip && !may_be_unconfigured_pad(&listed, info.class()) {
-            continue;
-        }
-        let driver = match owner::exclusive_owner(&info) {
-            Some(Owner::Driver(name)) => Some(name),
-            _ => None,
-        };
-        if let (false, true, Some(name)) = (include_system, listed_gip, &driver) {
-            // Certainly a GIP pad and certainly the system's: leave it alone
-            held.push(system_owned(&info, name.clone()));
-            continue;
-        }
-        let device = match info.open().wait() {
-            Ok(device) => device,
-            Err(e) if listed_gip => {
-                if let Some(name) = driver {
-                    held.push(system_owned(&info, name));
-                    continue;
+    let mut held: Option<SystemOwned> = None;
+    let mut held_found: Option<D> = None;
+    let mut failed: Option<anyhow::Error> = None;
+    for result in results {
+        match result {
+            Inspected::Skip => {}
+            Inspected::Pad(pad) => return Ok(pad),
+            Inspected::Held(owned, pad) => {
+                held.get_or_insert(owned);
+                if held_found.is_none() {
+                    held_found = pad;
                 }
-                return Err(e).with_context(|| {
-                    format!(
-                        "opening the controller {:04x}:{:04x}",
-                        info.vendor_id(),
-                        info.product_id()
-                    )
-                });
             }
-            Err(e) => {
-                unreadable.push(format!(
-                    "{:04x}:{:04x} ({e})",
-                    info.vendor_id(),
-                    info.product_id()
-                ));
-                continue;
-            }
-        };
-        if let Some((config, interface, alt, ep_in, ep_out)) = gip_interface(&device) {
-            let system_owned = driver.map(|name| system_owned(&info, name));
-            let detected = Detected {
-                found: Found {
-                    vendor: info.vendor_id(),
-                    product: info.product_id(),
-                    config,
-                    interface,
-                    alt,
-                    ep_in,
-                    ep_out,
-                    info,
-                },
-                system_owned,
-            };
-            match &detected.system_owned {
-                None => return Ok(detected),
-                Some(owned) => {
-                    held.push(owned.clone());
-                    if include_system && held_found.is_none() {
-                        held_found = Some(detected);
-                    }
-                }
+            Inspected::Unreadable(device) => unreadable.push(device),
+            Inspected::Failed(error) => {
+                failed.get_or_insert(error);
             }
         }
     }
-    if let Some(detected) = held_found {
-        return Ok(detected);
+    if let Some(error) = failed {
+        return Err(error);
+    }
+    if let Some(pad) = held_found {
+        return Ok(pad);
     }
     // Only the first of several held pads is named
-    if let Some(owned) = held.into_iter().next() {
+    if let Some(owned) = held {
         return Err(owned.into());
     }
     if unreadable.is_empty() {
@@ -514,6 +480,77 @@ fn inspect_devices(
         "no Xbox One / Series controller (GIP over USB) found; could not read these devices: {}",
         unreadable.join(", ")
     )
+}
+
+fn inspect_devices(
+    include_system: bool,
+    devices: impl IntoIterator<Item = DeviceInfo>,
+) -> Result<Detected> {
+    first_pad(
+        devices
+            .into_iter()
+            .map(|info| inspect_device(include_system, info)),
+    )
+}
+
+fn inspect_device(include_system: bool, info: DeviceInfo) -> Inspected<Detected> {
+    let listed: Vec<(u8, u8, u8)> = info
+        .interfaces()
+        .map(|i| (i.class(), i.subclass(), i.protocol()))
+        .collect();
+    let listed_gip = listed.contains(&GIP_CLASS);
+    if !listed_gip && !may_be_unconfigured_pad(&listed, info.class()) {
+        return Inspected::Skip;
+    }
+    let driver = match owner::exclusive_owner(&info) {
+        Some(Owner::Driver(name)) => Some(name),
+        _ => None,
+    };
+    if let (false, true, Some(name)) = (include_system, listed_gip, &driver) {
+        // Certainly a GIP pad and certainly the system's: leave it alone
+        return Inspected::Held(system_owned(&info, name.clone()), None);
+    }
+    let device = match info.open().wait() {
+        Ok(device) => device,
+        Err(e) if listed_gip => {
+            if let Some(name) = driver {
+                return Inspected::Held(system_owned(&info, name), None);
+            }
+            return Inspected::Failed(anyhow::Error::new(e).context(format!(
+                "opening the controller {:04x}:{:04x}",
+                info.vendor_id(),
+                info.product_id()
+            )));
+        }
+        Err(e) => {
+            return Inspected::Unreadable(format!(
+                "{:04x}:{:04x} ({e})",
+                info.vendor_id(),
+                info.product_id()
+            ));
+        }
+    };
+    let Some((config, interface, alt, ep_in, ep_out)) = gip_interface(&device) else {
+        return Inspected::Skip;
+    };
+    let system_owned = driver.map(|name| system_owned(&info, name));
+    let detected = Detected {
+        found: Found {
+            vendor: info.vendor_id(),
+            product: info.product_id(),
+            config,
+            interface,
+            alt,
+            ep_in,
+            ep_out,
+            info,
+        },
+        system_owned,
+    };
+    match detected.system_owned.clone() {
+        None => Inspected::Pad(detected),
+        Some(owned) => Inspected::Held(owned, include_system.then_some(detected)),
+    }
 }
 
 impl Found {
@@ -931,6 +968,65 @@ mod tests {
             assert_eq!(Header::parse(&writes[0]).unwrap().length, fits);
             assert_eq!(gip.seq, 1, "a refused payload uses no sequence number");
         }
+    }
+
+    fn owned() -> SystemOwned {
+        SystemOwned {
+            vendor: 0x045e,
+            product: 0x0b12,
+            name: None,
+            owner: "XboxUSBDevice".into(),
+        }
+    }
+
+    #[test]
+    fn a_pad_that_cannot_be_opened_does_not_hide_a_free_one() {
+        let found = first_pad([
+            Inspected::Failed(anyhow::anyhow!("first pad: held by pid 42")),
+            Inspected::Skip,
+            Inspected::Pad("second pad"),
+        ]);
+        assert_eq!(found.unwrap(), "second pad");
+        // Without a usable pad, the first failure is the error, ahead of a held pad
+        let error = first_pad::<&str>([
+            Inspected::Held(owned(), Some("held pad")),
+            Inspected::Failed(anyhow::anyhow!("first failure")),
+            Inspected::Failed(anyhow::anyhow!("second failure")),
+        ])
+        .unwrap_err();
+        assert_eq!(error.to_string(), "first failure");
+    }
+
+    #[test]
+    fn devices_after_the_first_usable_pad_are_not_inspected() {
+        let mut inspected = 0;
+        let results = std::iter::from_fn(|| {
+            inspected += 1;
+            Some(Inspected::Pad(inspected))
+        });
+        assert_eq!(first_pad(results).unwrap(), 1);
+        assert_eq!(inspected, 1);
+    }
+
+    #[test]
+    fn held_and_unreadable_devices_explain_a_missing_pad() {
+        assert_eq!(
+            first_pad([
+                Inspected::Held(owned(), None),
+                Inspected::Held(owned(), Some(7))
+            ])
+            .unwrap(),
+            7
+        );
+        let error = first_pad::<u8>([Inspected::Held(owned(), None)]).unwrap_err();
+        assert_eq!(error.downcast_ref::<SystemOwned>(), Some(&owned()));
+        let error =
+            first_pad::<u8>([Inspected::Unreadable("1234:5678 (denied)".into())]).unwrap_err();
+        assert!(error
+            .to_string()
+            .ends_with("could not read these devices: 1234:5678 (denied)"));
+        let error = first_pad::<u8>([Inspected::Skip]).unwrap_err();
+        assert!(error.to_string().contains("is it plugged in by cable?"));
     }
 
     #[test]

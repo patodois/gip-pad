@@ -82,6 +82,8 @@ MUTANTS = [
      "u16::try_from(n).with_context(", "Ok::<u16, anyhow::Error>(n as u16).with_context("),
     ("M31 Guide is read from a fragment", "src/lib.rs",
      "CMD_GUIDE if h.chunk.is_none() => {", "CMD_GUIDE => {"),
+    ("M32 a pad that cannot be opened stops discovery", "src/lib.rs",
+     "failed.get_or_insert(error);", "return Err(error);"),
 ]
 
 
