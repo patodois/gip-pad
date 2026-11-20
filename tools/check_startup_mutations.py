@@ -2,8 +2,10 @@
 """Exercise startup regressions in a temporary source copy; never access USB hardware.
 
 A mutant counts only if it compiles and a Rust test fails. Originals are
-restored in the copy, and the work tree is untouched.
-Run: python3 tools/check_startup_mutations.py
+restored in the copy, and the work tree is untouched. The copy and its build
+live in a temporary directory that is removed at the end. A step that runs
+out of time counts as a failure of the check, never as a killed mutant.
+Run: python3 tools/check_startup_mutations.py   (CI runs it on macOS)
 """
 
 import os
@@ -96,14 +98,26 @@ FOCUSED_TESTS = {
 }
 
 
+# Seconds per cargo step: generous, so that a cold build on a slow runner still fits
+TIMEOUT = 900
+
+
 def run(copy, target, *args):
+    """Runs `cargo test` in the copy; None if it ran out of time."""
     env = dict(os.environ, CARGO_TARGET_DIR=str(target))
-    return subprocess.run(["cargo", "test", "--offline", "-q", *args], cwd=copy,
-                          env=env, capture_output=True, text=True, timeout=60)
+    try:
+        return subprocess.run(["cargo", "test", "--offline", "-q", *args], cwd=copy,
+                              env=env, capture_output=True, text=True, timeout=TIMEOUT)
+    except subprocess.TimeoutExpired:
+        return None
 
 
 def main():
-    workspace = Path(tempfile.mkdtemp(prefix="gip-pad-mutations-"))
+    with tempfile.TemporaryDirectory(prefix="gip-pad-mutations-") as workspace:
+        return check(Path(workspace))
+
+
+def check(workspace):
     copy = workspace / "source"
     target = workspace / "target"
     (copy / "src").mkdir(parents=True)
@@ -113,8 +127,9 @@ def main():
     for source in (SOURCE / "src").glob("*.rs"):
         shutil.copy2(source, copy / "src" / source.name)
     baseline = run(copy, target)
-    if baseline.returncode:
-        print("BASELINE FAILED\n" + baseline.stdout + baseline.stderr, flush=True)
+    if baseline is None or baseline.returncode:
+        detail = "timed out" if baseline is None else baseline.stdout + baseline.stderr
+        print("BASELINE FAILED\n" + detail, flush=True)
         return 1
     print("baseline: passed", flush=True)
     failed = 0
@@ -128,12 +143,20 @@ def main():
         try:
             path.write_text(original.replace(before, after))
             compilation = run(copy, target, "--no-run")
+            if compilation is None:
+                print(f"{label}: INVALID (compilation timed out)", flush=True)
+                failed += 1
+                continue
             if compilation.returncode:
                 print(f"{label}: INVALID (did not compile)\n{compilation.stderr}", flush=True)
                 failed += 1
                 continue
             test = FOCUSED_TESTS.get(label.split()[0])
             result = run(copy, target, *([test] if test else []))
+            if result is None:
+                print(f"{label}: INVALID (tests timed out)", flush=True)
+                failed += 1
+                continue
             failures = [line for line in result.stdout.splitlines() if "FAILED" in line and "::" in line]
             if result.returncode and failures:
                 print(f"{label}: killed; {failures[0].strip()}", flush=True)
@@ -146,7 +169,7 @@ def main():
         finally:
             path.write_text(original)
     restored = run(copy, target)
-    if restored.returncode:
+    if restored is None or restored.returncode:
         print("RESTORED BASELINE FAILED", flush=True)
         failed += 1
     else:
