@@ -37,8 +37,8 @@ This is the pad the code was written and tested with:
 | Interface 1 | headset audio (isochronous), not used here |
 | Versions (from the GIP announce packet) | firmware 2.0.3.0; hardware 2.0; RF, security and GIP protocol 1.0 each |
 | Preferred types (from the GIP metadata) | `Windows.Xbox.Input.Gamepad`, `Victrix.Xbox.Gamepad.Gambit` |
-| Input report | `0x20`, 50 bytes (payload `0x2e`); Share is bit 0 of byte 32 |
-| Start-up | power on, then the LED-on and `0x06` security packets this pad waits for |
+| Input report | `0x20`, 50 bytes (payload `0x2e`); the code reads Share from bit 0 of byte 32 (to measure) |
+| Start-up | power on, then the LED and `0x06` packets the code sends to PDP pads (whether the pad needs them: to measure) |
 | Rear buttons | mirrored by the pad itself to D-pad Up and B; they send no bits of their own |
 
 The metadata suggests the Afterglow Wave runs the same firmware platform as PDP's Victrix Gambit, so
@@ -178,14 +178,14 @@ inspection. On other platforms no owner is ever reported.
 
 ### Provenance
 
-The protocol code was written by an AI (Claude) from its general knowledge of GIP and of the Linux
-[`xpad`](https://github.com/torvalds/linux/blob/master/drivers/input/joystick/xpad.c) and
-[`xone`](https://github.com/dlundqvist/xone) drivers, without reading their source at the time. It was
-then checked against a real PDP pad and afterwards against Microsoft's published
-[MS-GIPUSB](https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-gipusb/e7c90904-5e21-426e-b9ad-d82adeee0dbc)
-specification. No source text from xpad, xone or the specification was copied.
+The code in this repository was written by an AI (Claude). No source text was copied from any other
+project or from the specification.
 
-What MS-GIPUSB states, and the code matches:
+Each protocol fact the code uses comes from Microsoft's published
+[MS-GIPUSB](https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-gipusb/e7c90904-5e21-426e-b9ad-d82adeee0dbc)
+specification or from observing the owner's PDP pad, or is listed as not yet shown.
+
+From MS-GIPUSB (the code cites the same sections):
 
 - Start: Set Device State, command `0x05`, flags `0x20`, state `0x00` (Tables 39 and 40, section 3.1.5.5.5).
 - The LED command `0x0A` layout: command, pattern, intensity (Tables 41 and 42, section 3.1.5.5.7).
@@ -200,15 +200,22 @@ What MS-GIPUSB states, and the code matches:
 - A packet with the acknowledge flag must be acknowledged with a type `0x01` packet of length 9
   (Table 26, section 3.1.5.1).
 
-What the specification text does not state, and was confirmed only on the PDP pad:
+Observed on the owner's PDP pad (`0e6f:0338`) with `gip-pad --info` and `--raw`: the USB descriptors,
+the announce fields, the preferred types in the metadata and the 46-byte input report, as listed in the
+example table above. The repository keeps these as text and, for the announce bytes, as a test fixture
+in `src/lib.rs`. It holds no USB captures.
+
+In neither yet. The code uses these values, but MS-GIPUSB does not state them and no measurement of
+them is recorded here. [`docs/measurements.md`](docs/measurements.md) says, for each, what to measure
+on the pad and how, and marks it "to measure":
 
 - The payload layout of the acknowledgement.
-- The `01 00` payload of the `0x06` security packet, and that this pad sends no input until it gets it
-  and the LED packet.
+- The LED packet `00 01 14` and the `0x06` packet `01 00` sent to PDP pads, and that the pad sends no
+  input without them.
 - The Guide button byte: the `0x07` packet is listed with a 2-byte payload, and section 3.1.5.5.6
-  describes only behaviour. Bit 0 of the first payload byte is what the pad sends.
+  describes only behaviour. The code reads bit 0 of the first payload byte.
 - The position of the Share button. Table 62 puts the Console Function Map at byte 18 of a 32-byte
-  payload; this pad sends a 46-byte payload (`0x2e`) with Share at bit 0 of byte 32.
+  payload; the code reads bit 0 of payload byte 28 in a 46-byte payload (`0x2e`).
 
 ## Disclaimer
 

@@ -94,7 +94,8 @@ pub(crate) fn send_start(transport: &mut impl Transport, vendor: u16) -> Result<
     // MS-GIPUSB 3.1.5.5.1 permits START as the Hello response without metadata.
     transport.send(CMD_POWER, OPT_INTERNAL, &[0x00])?;
     if vendor == PDP_VENDOR {
-        // Existing hardware-confirmed PDP sequence; MS-GIPUSB does not specify its security payload.
+        // The LED values and the 0x06 packet sent to PDP pads are not from MS-GIPUSB, and no
+        // measurement of them is recorded yet: docs/measurements.md lists them as to measure.
         transport.send(CMD_LED, OPT_INTERNAL, &[0x00, 0x01, 0x14])?;
         transport.send(CMD_AUTHENTICATE, OPT_INTERNAL, &[0x01, 0x00])?;
     }

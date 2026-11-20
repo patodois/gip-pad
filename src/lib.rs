@@ -5,16 +5,17 @@
 //! created, so games and the Game Controller framework never see them. This talks to the pad directly
 //! through the pure-Rust `nusb` crate (IOKit underneath).
 //!
-//! Provenance: this protocol code was written by an AI (Claude) from its general knowledge of GIP and of
-//! the Linux `xpad` and `xone` drivers, without reading their source at the time, then checked against
-//! a real PDP pad and afterwards against Microsoft's MS-GIPUSB specification. No source text was copied.
-//! The README lists which facts the specification states and which were found only on hardware.
+//! Provenance: this code was written by an AI (Claude). No source text was copied from any other
+//! project or from the specification. A protocol fact used here either comes from Microsoft's
+//! published MS-GIPUSB specification, cited by section where it is used, or was observed on the
+//! owner's PDP pad. The few values that are in neither are listed in `docs/measurements.md` as "to
+//! measure"; the README's Provenance section has the full list.
 //!
 //! GIP packets start with a 4-byte header: command, options, sequence number, payload length.
 //! - Host to pad, to start input: power on (0x05), and for PDP pads also LED on (0x0A) and the
 //!   security-state packet (0x06) that the pad waits for.
-//! - Pad to host: input (0x20) with buttons, triggers and sticks; the guide button (0x07), which asks
-//!   for an acknowledgement when its options carry 0x10.
+//! - Pad to host: input (0x20) with buttons, triggers and sticks; the guide button (0x07). A packet
+//!   whose options carry the acknowledge-request flag 0x10 is acknowledged.
 
 mod connection;
 pub mod owner;
@@ -92,7 +93,8 @@ impl Pad {
         self.right_trigger = u16le(4);
         self.left_stick = (i16le(6), i16le(8));
         self.right_stick = (i16le(10), i16le(12));
-        // The Share flag is payload byte 28 in Series-era reports.
+        // Share: bit 0 of payload byte 28 in a report of at least 46 bytes, the layout the owner's
+        // PDP pad uses. Not from MS-GIPUSB; docs/measurements.md lists it as to measure.
         self.share = h.length >= 0x2E && p[28] & 1 != 0;
         true
     }
@@ -282,8 +284,8 @@ impl Gip {
 
     /// Acknowledges a packet whose options ask for it. The ack carries the acknowledged packet's
     /// sequence number, and for chunked transfers how many bytes have arrived and how many remain.
-    /// The payload layout was confirmed on hardware; MS-GIPUSB gives only the packet's type, flags
-    /// and length (Table 26).
+    /// MS-GIPUSB gives the packet's type, flags and length (Table 26, section 3.1.5.1). The payload
+    /// layout is not in it; docs/measurements.md lists it as to measure.
     pub fn ack(&mut self, h: &Header, received: u16, remaining: u16) -> Result<()> {
         let [r0, r1] = received.to_le_bytes();
         let [m0, m1] = remaining.to_le_bytes();
@@ -728,7 +730,8 @@ impl Controller {
             CMD_INPUT => {
                 self.pad.apply_input(&p);
             }
-            // Bit 0 of the first payload byte; see the README on where this comes from
+            // Bit 0 of the first payload byte. Not from MS-GIPUSB; docs/measurements.md lists it
+            // as to measure.
             CMD_GUIDE if h.chunk.is_none() => {
                 if let Some(state) = h.body(&p).first() {
                     self.pad.guide = state & 1 != 0;
