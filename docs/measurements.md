@@ -100,17 +100,28 @@ The pad measured so far is the PDP Afterglow Wave Wired Controller for Xbox (`0e
   the code can refuse system-flagged input.
 - **Status:** to measure.
 
+## 6. Rumble payload: `09 00 SS 09 | 00 0F 00 00 SS SS DD 00 00`
+
+- **What the code does:** `Controller::rumble` sends the Direct Motor command `0x09`. MS-GIPUSB
+  (section 3.1.5.6.1, Table 56) names the command; the code's payload layout (motor mask, two trigger
+  motors, two main motors, on time, off time, repeat) is not recorded there or measured here.
+- **What to measure:** with `--info`, the short rumble at start. Then, with a build that changes one
+  byte at a time (the mask to `0x03` and to `0x0C`, the main motors to `0`, the on time to `0x32`):
+  which motors run, and for how long.
+- **What to record:** for each payload, which motors ran and the duration, timed by ear or video.
+- **Status:** to measure.
+
 ## Behaviour the code assumes
 
 These are not protocol values, but the code relies on them and no run has shown them yet.
 
-- **A pad that announces again during a session (since 0.3.1).** `Controller::poll` treats a valid
+- **A pad that announces again during a session (since 0.4.0).** `Controller::poll` treats a valid
   Hello (`0x02`) after startup as a restart: it sends the start packets again and reports every
   input as released until the pad reports again. To measure: run `gip-pad --raw --seconds 300`,
   partly idle and partly pressing buttons, and count the `0x02` packets after startup. None are
   expected from a pad that keeps working. If one does appear, check that input resumes after it.
   **Status:** to measure.
-- **A refused reset (since 0.3.1).** If macOS refuses the USB reset because the device is open
+- **A refused reset (since 0.4.0).** If macOS refuses the USB reset because the device is open
   exclusively elsewhere, `gip-pad` warns "USB reset refused" and opens the pad without a reset. To
   measure: note whether that warning ever appears with this pad, for instance while its headset
   audio interface is in use, and whether input still arrives after it. **Status:** to measure.

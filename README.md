@@ -159,6 +159,26 @@ inspection. On other platforms no owner is ever reported.
 
 ## Changes
 
+### 0.4.0
+
+- A USB reset refused because the device is open exclusively elsewhere no longer blocks opening:
+  the pad is opened as in 0.2.3 and `startup_status()` is the new `StartupStatus::ResetRefused`
+  (an exhaustive `match` on `StartupStatus` needs a new arm). `PadReader` keeps the reset available
+  for the next attempt instead of retrying it without ever opening the pad. The command line gains
+  `--no-reset`.
+- A pad that announces itself again during a session is restarted: the start packets are sent
+  again, and the state reads as all released until the pad reports input.
+- `Gip::send` refuses a payload longer than 127 bytes or one that does not fit one packet, instead
+  of writing a wrong length byte. Acknowledgement counts above 65535 are refused, not truncated.
+- The command line accepts only the arguments it knows, prints usage for `--help` or `-h` without
+  touching any device, and refuses a missing or non-numeric `--seconds` value.
+- Guide is read from the parsed packet, so extended lengths and fragments are handled. `find_gip()`
+  and `find_gip_any()` keep looking past a pad that cannot be opened. `stick()` clamps its dead
+  zone. `PadReader` reports a reader thread that stopped unexpectedly.
+- Provenance: the README and `docs/measurements.md` say which protocol facts come from MS-GIPUSB,
+  which were observed on the PDP pad, and which are still to measure. Add `AGENTS.md`. CI also runs
+  clippy, rustfmt and the mutation check, and the mutation check cleans up after itself.
+
 ### 0.3.0
 
 - Reset the pad and wait for its announce before starting input, recovering pads left in an old
