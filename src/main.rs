@@ -125,6 +125,11 @@ impl InfoSource for UsbInfo {
     }
 }
 
+/// A byte count for a 16-bit acknowledgement field, refusing one it cannot hold.
+fn ack_count(n: usize) -> Result<u16> {
+    u16::try_from(n).with_context(|| format!("{n} bytes do not fit an acknowledgement"))
+}
+
 fn startup_warning(status: StartupStatus) -> Option<&'static str> {
     match status {
         StartupStatus::TimedOut => {
@@ -208,15 +213,12 @@ fn info(
         }
         if h.options & OPT_ACK_WANTED != 0 && (h.command != 0x02 || h.is_announce(&p)) {
             let remaining = metadata.len().saturating_sub(received);
-            gip.ack(
-                &h,
-                if h.chunk.is_some() {
-                    received as u16
-                } else {
-                    h.length as u16
-                },
-                remaining as u16,
-            )?;
+            let acknowledged = if h.chunk.is_some() {
+                received
+            } else {
+                h.length
+            };
+            gip.ack(&h, ack_count(acknowledged)?, ack_count(remaining)?)?;
         }
         if !metadata.is_empty() && received >= metadata.len() {
             break;
@@ -363,6 +365,8 @@ mod info_flow_tests {
         invalid_hello: bool,
         returned_invalid: bool,
         acks: usize,
+        /// Announce a metadata total (70000) the 16-bit ACK fields cannot hold, and ask for an ACK.
+        huge_total: bool,
     }
     struct FakePackets(Arc<Mutex<FakeState>>);
     struct FakeInfo {
@@ -404,6 +408,20 @@ mod info_flow_tests {
                 packet.resize(32, 0);
                 packet[4 + 6] = 1;
                 return Ok(Some(packet));
+            }
+            if state.requests > 0 && !state.returned && state.huge_total {
+                state.returned = true;
+                return Ok(Some(vec![
+                    0x04,
+                    OPT_INTERNAL | OPT_CHUNK | OPT_CHUNK_START | OPT_ACK_WANTED,
+                    1,
+                    2,
+                    0xF0,
+                    0xA2,
+                    0x04,
+                    b'G',
+                    b'a',
+                ]));
             }
             if state.requests > 0 && !state.returned {
                 state.returned = true;
@@ -485,6 +503,14 @@ mod info_flow_tests {
         assert!(String::from_utf8(output)
             .unwrap()
             .contains("metadata: 6 of 6 bytes"));
+    }
+
+    #[test]
+    fn metadata_lengths_are_never_truncated_in_an_acknowledgement() {
+        let mut source = source(StartupStatus::Announced);
+        source.state.lock().unwrap().huge_total = true;
+        assert!(info(&mut source, false, &mut Vec::new(), &mut Vec::new()).is_err());
+        assert_eq!(source.state.lock().unwrap().acks, 0);
     }
 
     #[test]

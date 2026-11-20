@@ -243,10 +243,28 @@ pub struct Gip {
     pub seq: u8,
 }
 
+/// A packet length as the 16-bit count of an acknowledgement, refusing one it cannot hold.
+pub(crate) fn ack_count(n: usize) -> Result<u16> {
+    u16::try_from(n).with_context(|| format!("{n} bytes do not fit an acknowledgement"))
+}
+
 impl Gip {
+    /// Sends one packet with a 4-byte header. The payload must fit a one-byte length (at most 127
+    /// bytes, since bit 7 would extend the length) and, with the header, one packet of the OUT
+    /// endpoint; anything larger would need fragmentation (MS-GIPUSB 3.1.5.2) and is refused.
     pub fn send(&mut self, cmd: u8, options: u8, payload: &[u8]) -> Result<()> {
+        let max = self.io.max_packet_size();
+        let Some(length) = u8::try_from(payload.len())
+            .ok()
+            .filter(|&n| n <= 0x7F && 4 + usize::from(n) <= max)
+        else {
+            bail!(
+                "sending command {cmd:#04x}: a {}-byte payload does not fit one {max}-byte packet",
+                payload.len()
+            );
+        };
         self.seq = self.seq.wrapping_add(1).max(1);
-        let mut packet = vec![cmd, options, self.seq, payload.len() as u8];
+        let mut packet = vec![cmd, options, self.seq, length];
         packet.extend_from_slice(payload);
         self.write(&packet)
             .with_context(|| format!("sending command {cmd:#04x}"))
@@ -660,7 +678,7 @@ impl Controller {
                 if let Some(h) =
                     Header::parse(&p).filter(|h| h.command != 0x02 || h.is_announce(&p))
                 {
-                    self.gip.ack(&h, h.length as u16, 0)?;
+                    self.gip.ack(&h, ack_count(h.length)?, 0)?;
                 }
             }
             if Header::parse(&p).is_some_and(|h| h.is_announce(&p)) {
@@ -864,6 +882,51 @@ mod tests {
         assert_eq!(stick(-32768, 0.15), -1.0);
         assert!((stick(16384, 0.0) - 0.5).abs() < 1e-3);
         assert_eq!((trigger(0), trigger(1023)), (0.0, 1.0));
+    }
+
+    struct Sink {
+        max: usize,
+        writes: std::sync::Arc<std::sync::Mutex<Vec<Vec<u8>>>>,
+    }
+    impl connection::PacketIo for Sink {
+        fn read(&mut self, _: Duration) -> Result<Option<Vec<u8>>> {
+            Ok(None)
+        }
+        fn write(&mut self, packet: &[u8]) -> Result<()> {
+            self.writes.lock().unwrap().push(packet.to_vec());
+            Ok(())
+        }
+        fn max_packet_size(&self) -> usize {
+            self.max
+        }
+    }
+
+    #[test]
+    fn send_refuses_a_payload_that_does_not_fit_one_packet() {
+        for (max, fits, too_long) in [(64, 60, [61, 128, 300]), (512, 127, [128, 300, 509])] {
+            let writes = std::sync::Arc::default();
+            let mut gip = Gip {
+                io: Box::new(Sink {
+                    max,
+                    writes: std::sync::Arc::clone(&writes),
+                }),
+                ep_in: 0x81,
+                ep_out: 0x01,
+                seq: 0,
+            };
+            gip.send(0x0A, 0x20, &vec![7; fits]).unwrap();
+            for len in too_long {
+                assert!(
+                    gip.send(0x0A, 0x20, &vec![7; len]).is_err(),
+                    "{len} of {max}"
+                );
+            }
+            let writes = writes.lock().unwrap();
+            assert_eq!(writes.len(), 1);
+            assert_eq!(writes[0][..4], [0x0A, 0x20, 1, fits as u8]);
+            assert_eq!(Header::parse(&writes[0]).unwrap().length, fits);
+            assert_eq!(gip.seq, 1, "a refused payload uses no sequence number");
+        }
     }
 
     #[test]

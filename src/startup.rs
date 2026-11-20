@@ -83,7 +83,7 @@ pub(crate) fn wait_for_announce(
         on_packet(&packet);
         if let Some(h) = Header::parse(&packet).filter(|h| is_announce(h, &packet)) {
             if h.options & OPT_ACK_WANTED != 0 {
-                transport.ack(&h, h.length as u16, 0)?;
+                transport.ack(&h, crate::ack_count(h.length)?, 0)?;
             }
             return Ok(StartupStatus::Announced);
         }
@@ -383,6 +383,24 @@ mod tests {
             "Hello must finish the wait immediately"
         );
         assert_eq!(transport.acks, [(1, 30, 0)]);
+    }
+
+    #[test]
+    fn hello_too_long_for_the_ack_length_field_is_not_acknowledged() {
+        let mut packet = vec![0x02, OPT_INTERNAL | OPT_ACK_WANTED, 1, 0xF0, 0xA2, 0x04];
+        packet.extend(&hello()[4..]);
+        packet.resize(6 + 70_000, 0);
+        let mut fake = StalePad {
+            emit_announce: false,
+            packets: [packet].into(),
+            ..StalePad::default()
+        };
+        let clock = WallClock(std::time::Instant::now());
+        assert!(wait_for_announce(&mut fake, &clock, Duration::from_secs(1), |_| {}).is_err());
+        assert!(
+            fake.acks.is_empty(),
+            "no acknowledgement with a truncated length"
+        );
     }
 
     #[test]

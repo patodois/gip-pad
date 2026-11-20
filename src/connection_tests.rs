@@ -225,6 +225,9 @@ impl PacketIo for FakeIo {
         }
         Ok(())
     }
+    fn max_packet_size(&self) -> usize {
+        64
+    }
 }
 
 fn install(state: State) -> Arc<Mutex<State>> {
@@ -593,6 +596,9 @@ impl PacketIo for RefusingIo {
         }
         Ok(())
     }
+    fn max_packet_size(&self) -> usize {
+        64
+    }
 }
 
 fn spawn_refusing(state: &Arc<Mutex<Refusing>>) -> PadReader {
@@ -692,6 +698,9 @@ impl PacketIo for QuietIo {
     }
     fn write(&mut self, _: &[u8]) -> Result<()> {
         Ok(())
+    }
+    fn max_packet_size(&self) -> usize {
+        64
     }
 }
 
@@ -874,6 +883,9 @@ impl PacketIo for QueuedIo {
         self.writes.lock().unwrap().push(packet.to_vec());
         Ok(())
     }
+    fn max_packet_size(&self) -> usize {
+        64
+    }
 }
 
 #[test]
@@ -899,6 +911,25 @@ fn polling_only_acknowledges_hello_with_a_valid_device_id() {
         writes.iter().map(|p| p[0]).collect::<Vec<_>>(),
         [crate::CMD_ACK, CMD_POWER, CMD_LED, CMD_AUTHENTICATE],
         "invalid Hello IDs must not receive ACKs during input polling; the valid one restarts the pad"
+    );
+}
+
+#[test]
+fn polling_refuses_to_acknowledge_a_length_the_ack_cannot_hold() {
+    install(State::default());
+    let mut controller = Controller::open().unwrap();
+    // A packet whose three-byte varint length (70000) does not fit the 16-bit ACK field
+    let mut huge = vec![0x0B, crate::OPT_ACK_WANTED, 3, 0xF0, 0xA2, 0x04];
+    huge.resize(6 + 70_000, 0);
+    let writes = Arc::new(Mutex::new(Vec::new()));
+    controller.gip.io = Box::new(QueuedIo {
+        packets: [huge].into(),
+        writes: writes.clone(),
+    });
+    assert!(controller.poll(Duration::ZERO).is_err());
+    assert!(
+        writes.lock().unwrap().is_empty(),
+        "no acknowledgement with a truncated length"
     );
 }
 

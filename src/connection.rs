@@ -15,6 +15,8 @@ use crate::{Controller, Found, Gip, Pad, StartupStatus};
 pub(crate) trait PacketIo: Send {
     fn read(&mut self, timeout: Duration) -> Result<Option<Vec<u8>>>;
     fn write(&mut self, packet: &[u8]) -> Result<()>;
+    /// The largest packet the OUT endpoint takes in one transfer.
+    fn max_packet_size(&self) -> usize;
 }
 
 pub(crate) struct UsbIo {
@@ -45,6 +47,10 @@ impl PacketIo for UsbIo {
             .transfer_blocking(buf, Duration::from_millis(500))
             .status?;
         Ok(())
+    }
+
+    fn max_packet_size(&self) -> usize {
+        self.writer.max_packet_size()
     }
 }
 

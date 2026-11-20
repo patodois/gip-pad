@@ -40,7 +40,7 @@ MUTANTS = [
     ("M8 Hello rejects larger payloads", "src/startup.rs",
      "h.length >= 28", "h.length == 28"),
     ("M9 Hello omits requested ACK", "src/startup.rs",
-     "transport.ack(&h, h.length as u16, 0)?;", ""),
+     "transport.ack(&h, crate::ack_count(h.length)?, 0)?;", ""),
     ("M10 reset Unsupported becomes fatal", "src/connection.rs",
      "nusb::ErrorKind::Unsupported => Some(ResetResult::Unsupported),",
      "nusb::ErrorKind::Unsupported => None,"),
@@ -73,6 +73,13 @@ MUTANTS = [
      "startup::send_start(&mut self.gip, self.vendor)\n                    .context(", "Ok::<(), anyhow::Error>(())\n                    .context("),
     ("M27 a Hello during polling keeps the last state", "src/lib.rs",
      "self.pad = Pad::default();\n", ""),
+    ("M28 send accepts a length byte with bit 7 set", "src/lib.rs",
+     ".filter(|&n| n <= 0x7F && 4 + usize::from(n) <= max)",
+     ".filter(|&n| 4 + usize::from(n) <= max)"),
+    ("M29 send ignores the packet size", "src/lib.rs",
+     ".filter(|&n| n <= 0x7F && 4 + usize::from(n) <= max)", ".filter(|&n| n <= 0x7F)"),
+    ("M30 acknowledgement counts are truncated", "src/lib.rs",
+     "u16::try_from(n).with_context(", "Ok::<u16, anyhow::Error>(n as u16).with_context("),
 ]
 
 
