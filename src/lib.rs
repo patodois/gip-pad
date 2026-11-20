@@ -807,13 +807,33 @@ impl PadReader {
 
     /// The latest state, or `None` while no pad is connected.
     pub fn latest(&self) -> Option<Pad> {
-        *self.latest.lock().unwrap()
+        if self.died() {
+            return None;
+        }
+        *self
+            .latest
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     /// Why there is no pad right now (not found, held by another program, unplugged), or `None`
     /// while one is being read.
     pub fn last_error(&self) -> Option<String> {
-        self.error.lock().unwrap().clone()
+        if self.died() {
+            return Some("the controller reader stopped unexpectedly".into());
+        }
+        self.error
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    /// Whether the reader thread ended before it was asked to: it only ends on its own by
+    /// panicking, which no device input is known to cause.
+    fn died(&self) -> bool {
+        self.thread
+            .as_ref()
+            .is_some_and(std::thread::JoinHandle::is_finished)
     }
 }
 

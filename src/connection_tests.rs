@@ -783,6 +783,35 @@ fn dropping_reader_interrupts_the_eight_second_retry_wait() {
     assert_eq!(*now.lock().unwrap(), Duration::from_millis(7100));
 }
 
+struct PanickingBackend;
+impl Clock for PanickingBackend {
+    fn now(&self) -> Duration {
+        Duration::ZERO
+    }
+}
+impl Backend for PanickingBackend {
+    fn devices(&mut self, _target: Option<&Port>) -> Result<Vec<Candidate>> {
+        panic!("fake backend failure (expected by this test)");
+    }
+    fn reset(&mut self, _: &Candidate) -> Result<ResetResult> {
+        unreachable!()
+    }
+    fn open(&mut self, _: &Candidate) -> Result<Gip> {
+        unreachable!()
+    }
+    fn sleep(&mut self, _: Duration) {}
+}
+
+#[test]
+fn a_reader_thread_that_dies_is_reported() {
+    TEST_BACKEND.with(|slot| *slot.borrow_mut() = Some(Box::new(PanickingBackend)));
+    let reader = PadReader::spawn();
+    wait_until(|| reader.last_error().is_some());
+    assert!(reader.last_error().unwrap().contains("stopped"));
+    assert_eq!(reader.latest(), None);
+    drop(reader);
+}
+
 #[test]
 fn targeted_discovery_filters_before_inspecting_other_devices() {
     let origin = candidate().port;
