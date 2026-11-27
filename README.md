@@ -1,4 +1,4 @@
-# gip-pad
+<h1 align="center"><img src="docs/title.png" alt="gip-pad" width="273"></h1>
 
 Use wired Xbox One / Series style controllers on macOS when macOS has no driver for them.
 
